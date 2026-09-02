@@ -88,6 +88,7 @@ def test_pick_series_only_mix_and_limit():
 def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         base_url, model, out_dir: Path):
     state = douyin_auto.load_state(out_dir)
+    douyin_auto.reconcile_state(out_dir, state)
     done_ids = (set(state["processed"])
                 | douyin_search.existing_ids_under(
                     douyin_search.DOWNLOADS_DIR))

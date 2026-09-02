@@ -110,6 +110,24 @@ def save_state(out_dir: Path, state: dict) -> None:
         json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def reconcile_state(out_dir: Path, state: dict) -> int:
+    """状态自愈：clean/watermarked 记录对应的文件已不存在 → 删除记录。
+
+    让"删目录=可重跑"成立（否则删了文件状态仍拦着不下）。
+    skip（图集等语义跳过）不依赖文件存在，保留。返回清理条数。
+    """
+    alive = douyin_search.existing_ids_under(douyin_search.DOWNLOADS_DIR)
+    drop = [vid for vid, v in state["processed"].items()
+            if v.get("verdict") in ("clean", "watermarked")
+            and vid not in alive]
+    for vid in drop:
+        del state["processed"][vid]
+    if drop:
+        save_state(out_dir, state)
+        print(f"[状态清理] {len(drop)} 条记录的文件已不存在，已重置（可重新下载）")
+    return len(drop)
+
+
 def find_by_id(out_dir: Path, aweme_id: str):
     """按文件名尾部 ID 在目录中定位 mp4。"""
     for f in out_dir.glob(f"*_{aweme_id}.mp4"):
@@ -238,6 +256,7 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
     quarantine = out_dir / "疑似水印"
     workdir = out_dir / ".wm_frames"
     state = load_state(out_dir)
+    reconcile_state(out_dir, state)
 
     # 疑似水印目录里的历史文件 → 直接视为已判水印（含手动 run_wm 移过去的）
     for vid in ids_from_filenames(quarantine):
