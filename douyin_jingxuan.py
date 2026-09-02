@@ -110,6 +110,9 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
     for i, it in enumerate(series_list, 1):
         name = it.get("mix_name") or (it["title"][:20] or "未命名剧集")
         print(f"\n=== 剧集 [{i}/{len(series_list)}] {name[:24]} ===")
+        if it.get("sec_uid"):
+            print(f"作者: {it.get('nick') or '?'}  "
+                  f"主页: https://www.douyin.com/user/{it['sec_uid']}")
         try:
             eps = douyin_search.collect_mix(it["aweme_id"])
         except douyin_search.SearchError as e:

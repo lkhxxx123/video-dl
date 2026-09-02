@@ -172,7 +172,8 @@ def download_mix(video_id: str, judge: bool, api_key: str = "",
     """
     fb = douyin_dl.resolve_via_browser(video_id)
     print(f"标题: {(fb.get('title') or '?')[:36]}")
-    print(f"作者: {fb.get('author') or '?'}")
+    print(f"作者: {fb.get('author') or '?'}  "
+          f"主页: https://www.douyin.com/user/{fb.get('sec_uid') or '(无)'}")
     out_dir = douyin_search.make_dated_dir(douyin_search.DOWNLOADS_DIR)
     print(f"输出目录: {out_dir}")
     eps, name = [], fb.get("mix_name") or ""
@@ -355,6 +356,9 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
             if vid in state["processed"]:
                 continue
             print(f"\n→ [{clean + 1}/{target}] {title[:30] or vid}")
+            if it.get("sec_uid"):
+                print(f"作者: {it.get('nick') or '?'}  "
+                      f"主页: https://www.douyin.com/user/{it['sec_uid']}")
             if it.get("mix_id"):
                 # 剧集：拉全部集（豁免筛选），每集计数；选定即整部拿全
                 print(f"  ⚑ 剧集: {(it.get('mix_name') or '?')[:24]}"
