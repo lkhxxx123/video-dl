@@ -1,0 +1,14 @@
+# 敏感：API Key 与浏览器登录态，绝不入库
+key.txt
+.browser-profile/
+
+# 运行产物
+downloads/
+__pycache__/
+.wm_frames/
+*.pyc
+
+# 调试/取证临时文件
+_*.png
+_*.json
+_verify_*.py
