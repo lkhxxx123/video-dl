@@ -407,8 +407,11 @@ def collect_many(keywords, limit, max_followers=None, max_duration=None,
 
     seen: 额外提供的"已处理 ID 集合"（流水线复用，跳过历史视频）。
     block_keywords: 作者黑名单关键词（过滤搬运/侵权类账号）。
+    prefer_jingxuan: 精选路由优先。
+    注意：复制入参 set —— 搜索命中的候选 ID 不会污染调用方集合
+    （否则入口候选视频作为剧集分集时会被误判"已处理"而静默跳过）。
     """
-    seen_ids = seen if seen is not None else set()
+    seen_ids = set(seen) if seen is not None else set()
     merged = []
     with open_browser() as context:
         page = _first_page(context)
@@ -1022,6 +1025,29 @@ def test_episode_collection_id():
         "https://www.douyin.com/aweme/v1/web/series/aweme/"
         "?series_id=7312345678901&cursor=10") == "7312345678901"
     assert _episode_collection_id("https://www.douyin.com/other?a=1") is None
+
+
+def test_collect_many_copies_caller_seen():
+    """搜索不得污染调用方 seen（入口候选=剧集分集时会被误判已处理）。"""
+    import unittest.mock as mock
+    caller = {"X"}
+    got = {}
+
+    def fake_collect(*args, **kwargs):
+        got["seen"] = args[7] if len(args) > 7 else kwargs.get("seen_ids")
+        return []
+
+    with mock.patch.object(sys.modules[__name__], "_collect_page",
+                           fake_collect), \
+         mock.patch.object(sys.modules[__name__], "_first_page",
+                           return_value=None), \
+         mock.patch.object(sys.modules[__name__], "ensure_login",
+                           return_value=None), \
+         mock.patch.object(sys.modules[__name__], "open_browser") as ob:
+        ob.return_value.__enter__.return_value = object()
+        collect_many(["词"], 5, seen=caller)
+    assert got["seen"] is not caller, "collect 收到的是调用方原集合"
+    assert caller == {"X"}, "调用方集合被污染"
 
 
 def test_search_urls_fallback_routes():
