@@ -118,7 +118,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         print(f"入口视频: {it['aweme_id']}")
         try:
             eps = douyin_search.collect_mix(
-                it["aweme_id"], sec_uid=it.get("sec_uid") or "")
+                it["aweme_id"], sec_uid=it.get("sec_uid") or "",
+                mix_id=it.get("mix_id") or "")
         except douyin_search.SearchError as e:
             print(f"  !! 拉全集失败: {e}")
             continue
@@ -128,7 +129,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             print("  ↳ 疑似翻页不全，重拉一次…", flush=True)
             try:
                 eps2 = douyin_search.collect_mix(
-                    it["aweme_id"], sec_uid=it.get("sec_uid") or "")
+                    it["aweme_id"], sec_uid=it.get("sec_uid") or "",
+                    mix_id=it.get("mix_id") or "")
             except douyin_search.SearchError:
                 eps2 = []
             if len(eps2) > len(eps):

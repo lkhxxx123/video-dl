@@ -179,7 +179,8 @@ def download_mix(video_id: str, judge: bool, api_key: str = "",
     eps, name = [], fb.get("mix_name") or ""
     try:
         eps = douyin_search.collect_mix(video_id,
-                                        sec_uid=fb.get("sec_uid") or "")
+                                        sec_uid=fb.get("sec_uid") or "",
+                                        mix_id=fb.get("mix_id") or "")
         print(f"剧集面板接口共拿到 {len(eps)} 集")
     except douyin_search.SearchError as e:
         print(f"!! 剧集面板接口失败: {e}")
@@ -366,7 +367,8 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
                       f" → 拉取全部集", flush=True)
                 try:
                     eps = douyin_search.collect_mix(
-                        vid, sec_uid=it.get("sec_uid") or "")
+                        vid, sec_uid=it.get("sec_uid") or "",
+                        mix_id=it.get("mix_id") or "")
                 except douyin_search.SearchError as e:
                     print(f"  !! 拉全集失败: {e}")
                     eps = []

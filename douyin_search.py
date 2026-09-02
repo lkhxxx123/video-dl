@@ -439,23 +439,40 @@ def _compilation_url(sec_uid: str, video_id: str) -> str:
             f"?modal_id={video_id}&showSubTab=compilation&showTab=post")
 
 
-def collect_mix(video_id: str, sec_uid: str = ""):
-    """打开作者主页合集页收集全部集（合集 mix / 系列 series 双拦截）。
+def _episode_collection_id(url: str):
+    """从剧集接口 URL 提取合集/系列 ID（mix_id= / series_id= 参数）。"""
+    m = re.search(r"[?&](?:mix_id|series_id)=(\d+)", url)
+    return m.group(1) if m else None
+
+
+def collect_mix(video_id: str, sec_uid: str = "", mix_id=""):
+    """打开作者主页合集页收集指定合集的全部集。
 
     实测(2026-09-02)：完整分集列表在作者主页 compilation 子标签
     /user/{sec_uid}?modal_id={video}&showSubTab=compilation&showTab=post；
-    视频页面板只预取第一页。无 sec_uid 时先开视频页从 detail 接口取。
+    页面滚过本合集末尾会加载作者其他内容——必须按 mix_id/series_id
+    过滤拦截到的响应，否则混入其他合集的视频。
+    mix_id 未提供时从首个剧集接口响应学习（modal 指定视频所属合集先到）。
     返回按集数升序的 [{aweme_id, title, ep}]；非剧集或无数据抛 SearchError。
     """
+    target = str(mix_id) if mix_id else ""
     with open_browser() as context:
         page = _first_page(context)
         ensure_login(context, page)
         seen, items = set(), []
-        state = {"has_more": True, "total": None, "sec_uid": sec_uid}
+        state = {"has_more": True, "total": None, "sec_uid": sec_uid,
+                 "target": target}
 
         def on_response(resp):
             url = resp.url
             if any(s in url for s in EPISODE_URL_SUBSTRS):
+                url_cid = _episode_collection_id(url)
+                if state["target"]:
+                    if url_cid and url_cid != state["target"]:
+                        return  # 其他合集/作者其他内容，忽略
+                elif url_cid:
+                    state["target"] = url_cid  # 从首个响应学习目标合集
+                    print(f"  (目标合集ID: {url_cid})", flush=True)
                 payload = resp_json(resp)
                 if payload is None:
                     return
@@ -889,6 +906,16 @@ def test_split_keywords():
 
 
 # ---------- tests: 日期目录与全局去重 ----------
+
+def test_episode_collection_id():
+    assert _episode_collection_id(
+        "https://www.douyin.com/aweme/v1/web/mix/aweme/"
+        "?mix_id=7301234567890&cursor=0") == "7301234567890"
+    assert _episode_collection_id(
+        "https://www.douyin.com/aweme/v1/web/series/aweme/"
+        "?series_id=7312345678901&cursor=10") == "7312345678901"
+    assert _episode_collection_id("https://www.douyin.com/other?a=1") is None
+
 
 def test_search_urls_fallback_routes():
     urls = _search_urls("AI 短剧")
