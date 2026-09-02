@@ -437,32 +437,39 @@ def _goto_episode_list(page) -> bool:
     """从视频页进入"剧集列表"整页（或全屏列表），使全部集可滚动翻页。
 
     实测(2026-09)：视频页面板只预取第一页。策略：
-    ① DOM 里找合集/系列链接直接跳转；② 点击"共N集/合集/系列"入口。
+    ① DOM 里找真正的合集路由链接(/mix/、collection_id=、/series/)直接跳转
+       ——不能用宽泛的 collection 匹配，会误中页头"收藏"(用户自己的收藏页)；
+    ② 点击"共N集/合集"入口。均校验落点。
     返回是否成功切换（失败则留在原页，靠窗口滚动兜底）。
     """
+    link_pats = ("/mix/", "collection_id=", "/series/")
     href = page.evaluate(
-        """() => {
-            const pats = [/\\/mix\\//, /collection/i, /\\/series\\//];
+        """(pats) => {
             for (const a of document.querySelectorAll('a[href]')) {
-                if (pats.some(p => p.test(a.href))) return a.href;
+                if (pats.some(p => a.href.includes(p))) return a.href;
             }
             return null;
-        }""")
+        }""", list(link_pats))
     if href:
         try:
             page.goto(href, timeout=30000)
             _wait_captcha(page)
-            print("  (已跳转剧集列表页：面板链接)", flush=True)
-            return True
+            if any(p in page.url for p in link_pats):
+                print("  (已跳转剧集列表页：面板链接)", flush=True)
+                return True
+            print(f"  (链接落点异常: {page.url[:60]}，改用点击入口)",
+                  flush=True)
         except Exception:
             pass
-    for pattern in (r"共\s*\d+\s*[集期]", "合集", "系列"):
+    for pattern in (r"共\s*\d+\s*[集期卷]", "合集"):
         try:
             loc = page.get_by_text(re.compile(pattern)).first
             loc.click(timeout=3000)
             page.wait_for_timeout(2500)
-            print(f"  (已打开剧集列表：点击「{pattern}」入口)", flush=True)
-            return True
+            if any(p in page.url for p in link_pats) or page.url != \
+                    page.url:  # 点击后 URL 变化即认为切换成功
+                print(f"  (已打开剧集列表：点击「{pattern}」入口)", flush=True)
+                return True
         except Exception:
             continue
     print("  (⚠ 未能进入剧集列表页，只有面板第一页)", flush=True)

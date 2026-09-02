@@ -42,8 +42,8 @@ def cn_to_int(s: str):
 
 
 EP_PATTERNS = [
-    re.compile(r"第\s*(\d{1,4})\s*[集期话回]"),
-    re.compile(r"第\s*([零一二两三四五六七八九十百]+)\s*[集期话回]"),
+    re.compile(r"第\s*(\d{1,4})\s*[集期话回卷章篇]"),
+    re.compile(r"第\s*([零一二两三四五六七八九十百]+)\s*[集期话回卷章篇]"),
     re.compile(r"(?:^|[^A-Za-z0-9])[Ee][Pp]\s*\.?\s*(\d{1,4})"),
     re.compile(r"(?:^|[^0-9])(\d{1,3})\s*/\s*\d{1,3}(?:$|[^0-9])"),
     re.compile(r"(?:^|[^0-9])(\d{1,3})\s*集"),
