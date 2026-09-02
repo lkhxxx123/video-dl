@@ -433,62 +433,25 @@ def collect_many(keywords, limit, max_followers=None, max_duration=None,
     return merged[:limit]
 
 
-def _goto_episode_list(page) -> bool:
-    """从视频页进入"剧集列表"整页（或全屏列表），使全部集可滚动翻页。
-
-    实测(2026-09)：视频页面板只预取第一页。策略：
-    ① DOM 里找真正的合集路由链接(/mix/、collection_id=、/series/)直接跳转
-       ——不能用宽泛的 collection 匹配，会误中页头"收藏"(用户自己的收藏页)；
-    ② 点击"共N集/合集"入口。均校验落点。
-    返回是否成功切换（失败则留在原页，靠窗口滚动兜底）。
-    """
-    link_pats = ("/mix/", "collection_id=", "/series/")
-    href = page.evaluate(
-        """(pats) => {
-            for (const a of document.querySelectorAll('a[href]')) {
-                if (pats.some(p => a.href.includes(p))) return a.href;
-            }
-            return null;
-        }""", list(link_pats))
-    if href:
-        try:
-            page.goto(href, timeout=30000)
-            _wait_captcha(page)
-            if any(p in page.url for p in link_pats):
-                print("  (已跳转剧集列表页：面板链接)", flush=True)
-                return True
-            print(f"  (链接落点异常: {page.url[:60]}，改用点击入口)",
-                  flush=True)
-        except Exception:
-            pass
-    for pattern in (r"共\s*\d+\s*[集期卷]", "合集"):
-        try:
-            loc = page.get_by_text(re.compile(pattern)).first
-            loc.click(timeout=3000)
-            page.wait_for_timeout(2500)
-            if any(p in page.url for p in link_pats) or page.url != \
-                    page.url:  # 点击后 URL 变化即认为切换成功
-                print(f"  (已打开剧集列表：点击「{pattern}」入口)", flush=True)
-                return True
-        except Exception:
-            continue
-    print("  (⚠ 未能进入剧集列表页，只有面板第一页)", flush=True)
-    return False
+def _compilation_url(sec_uid: str, video_id: str) -> str:
+    """作者主页合集子标签 URL（用户实测指认：完整分集列表带第几集标记）。"""
+    return (f"https://www.douyin.com/user/{sec_uid}"
+            f"?modal_id={video_id}&showSubTab=compilation&showTab=post")
 
 
-def collect_mix(video_id: str):
-    """进入剧集列表页收集全部集（合集 mix / 系列 series 双拦截）。
+def collect_mix(video_id: str, sec_uid: str = ""):
+    """打开作者主页合集页收集全部集（合集 mix / 系列 series 双拦截）。
 
-    关键(实测 2026-09)：视频页面板只预取第一页（例：34 集只见 6 集），
-    必须进列表页整页滚动才能翻完。以 detail/响应携带的总集数做完成度
-    校验，不足时打印 ⚠，不再静默截断。
+    实测(2026-09-02)：完整分集列表在作者主页 compilation 子标签
+    /user/{sec_uid}?modal_id={video}&showSubTab=compilation&showTab=post；
+    视频页面板只预取第一页。无 sec_uid 时先开视频页从 detail 接口取。
     返回按集数升序的 [{aweme_id, title, ep}]；非剧集或无数据抛 SearchError。
     """
     with open_browser() as context:
         page = _first_page(context)
         ensure_login(context, page)
         seen, items = set(), []
-        state = {"has_more": True, "total": None}
+        state = {"has_more": True, "total": None, "sec_uid": sec_uid}
 
         def on_response(resp):
             url = resp.url
@@ -514,21 +477,29 @@ def collect_mix(video_id: str):
                     ec = mix.get("episode_count")
                     if isinstance(ec, int):
                         state["total"] = ec
+                    su = (data.get("author") or {}).get("sec_uid")
+                    if su:
+                        state["sec_uid"] = su
 
         page.on("response", on_response)
         try:
-            page.goto(f"https://www.douyin.com/video/{video_id}",
-                      timeout=30000)
+            if state["sec_uid"]:
+                page.goto(_compilation_url(state["sec_uid"], video_id),
+                          timeout=30000)
+            else:
+                page.goto(f"https://www.douyin.com/video/{video_id}",
+                          timeout=30000)
+                deadline = time.time() + 20
+                while time.time() < deadline and not state["sec_uid"]:
+                    page.wait_for_timeout(1500)
+                if state["sec_uid"]:
+                    page.goto(_compilation_url(state["sec_uid"], video_id),
+                              timeout=30000)
             _wait_captcha(page)
-            # 等首个剧集接口响应（面板第一页）
+            # 等首个剧集接口响应
             deadline = time.time() + 20
-            while time.time() < deadline:
-                if items:
-                    break
+            while time.time() < deadline and not items:
                 page.wait_for_timeout(1500)
-            # 关键：进入剧集列表整页，让全部集可滚动加载
-            if _goto_episode_list(page):
-                page.wait_for_timeout(2500)
             # 滚动拉全：JS 滚到底(不依赖焦点/坐标) + 模拟滚轮双保险
             idle = 0
             while idle < 12:

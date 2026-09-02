@@ -114,7 +114,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             print(f"作者: {it.get('nick') or '?'}  "
                   f"主页: https://www.douyin.com/user/{it['sec_uid']}")
         try:
-            eps = douyin_search.collect_mix(it["aweme_id"])
+            eps = douyin_search.collect_mix(
+                it["aweme_id"], sec_uid=it.get("sec_uid") or "")
         except douyin_search.SearchError as e:
             print(f"  !! 拉全集失败: {e}")
             continue
