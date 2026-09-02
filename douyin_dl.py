@@ -263,6 +263,38 @@ def resolve_via_browser(aweme_id: str) -> dict:
             context.close()
 
 
+def _via_browser(s, aweme_id: str, out_dir: Path, name_prefix: str) -> Path:
+    """浏览器兜底下载：拦 detail 接口拿 web 无水印直链再下。
+
+    用于：分享页被风控拿不到数据；分享页直链失效(如 404，付费/受限内容)。
+    """
+    print("  (切换浏览器兜底路线…)", flush=True)
+    fb = resolve_via_browser(aweme_id)
+    dest = out_dir / (name_prefix + build_filename(fb["title"], aweme_id))
+    if dest.exists():
+        print(f"已存在，跳过: {dest}")
+        record_manifest(out_dir, dest.name, fb["title"], fb["author"],
+                        fb.get("mix_name", ""), aweme_id)
+        return dest
+    print(f"标题: {fb['title'] or '(无)'}")
+    print(f"作者: {fb['author'] or '(未知)'}")
+    print("下载中…")
+    last_exc = None
+    for i, u in enumerate(fb["urls"], 1):
+        try:
+            download_video(s, u, dest, headers=WEB_HEADERS)
+            break
+        except Exception as e:  # noqa: BLE001 - 逐个直链尝试
+            print(f"  (直链{i}失败: {type(e).__name__}: {e})", flush=True)
+            last_exc = e
+    else:
+        raise last_exc or ParseError("兜底路线下载失败")
+    record_manifest(out_dir, dest.name, fb["title"], fb["author"],
+                    fb.get("mix_name", ""), aweme_id)
+    print(f"已保存: {dest}")
+    return dest
+
+
 # ---------- 编排 ----------
 
 def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
@@ -291,35 +323,9 @@ def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
             except ParseError:
                 time.sleep(0.8)
         if item is None:
-            # 分享页被风控 → 浏览器兜底路线（拦 detail 接口拿无水印直链）
-            print("  (分享页被风控，切换浏览器兜底路线…)", flush=True)
-            fb = resolve_via_browser(aweme_id)
-            dest = out_dir / (name_prefix +
-                              build_filename(fb["title"], aweme_id))
-            if dest.exists():
-                print(f"已存在，跳过: {dest}")
-                record_manifest(out_dir, dest.name, fb["title"],
-                                fb["author"], fb.get("mix_name", ""),
-                                aweme_id)
-                return dest
-            print(f"标题: {fb['title'] or '(无)'}")
-            print(f"作者: {fb['author'] or '(未知)'}")
-            print("下载中…")
-            last_exc = None
-            for i, u in enumerate(fb["urls"], 1):
-                try:
-                    download_video(s, u, dest, headers=WEB_HEADERS)
-                    break
-                except Exception as e:  # noqa: BLE001 - 逐个直链尝试
-                    print(f"  (直链{i}失败: {type(e).__name__}: {e})",
-                          flush=True)
-                    last_exc = e
-            else:
-                raise last_exc or ParseError("兜底路线下载失败")
-            record_manifest(out_dir, dest.name, fb["title"], fb["author"],
-                            fb.get("mix_name", ""), aweme_id)
-            print(f"已保存: {dest}")
-            return dest
+            # 分享页被风控 → 浏览器兜底路线
+            print("  (分享页被风控)", flush=True)
+            return _via_browser(s, aweme_id, out_dir, name_prefix)
         info = parse_item(item)
         dest = out_dir / (name_prefix +
                           build_filename(info["title"], aweme_id))
@@ -332,7 +338,12 @@ def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
         print(f"标题: {info['title'] or '(无)'}")
         print(f"作者: {info['author'] or '(未知)'}")
         print("下载中…")
-        download_video(s, info["no_wm_url"], dest)
+        try:
+            download_video(s, info["no_wm_url"], dest)
+        except Exception as e:  # noqa: BLE001 - 直链失效(如404)也走兜底
+            print(f"  (分享页直链失败: {type(e).__name__}，尝试浏览器兜底)",
+                  flush=True)
+            return _via_browser(s, aweme_id, out_dir, name_prefix)
     record_manifest(out_dir, dest.name, info["title"], info["author"],
                     info.get("mix_name", ""), aweme_id)
     print(f"已保存: {dest}")
