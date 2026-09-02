@@ -154,10 +154,19 @@ def record_manifest(out_dir: Path, filename: str, title: str, author: str,
 INVALID_FN_RE = re.compile(r'[\\/:*?"<>|\r\n]')
 
 
-def build_filename(title: str, aweme_id: str) -> str:
-    """标题清洗(非法字符→空格)+截断50字；空标题回退纯 ID。"""
+def build_filename(title: str, aweme_id: str, author: str = "") -> str:
+    """标题清洗+截断50字，可附 @作者；ID 恒在末尾（去重/定位依赖）。
+
+    形如: 标题_@作者_ID.mp4；无作者: 标题_ID.mp4；空标题回退纯 ID。
+    """
     clean = INVALID_FN_RE.sub(" ", title).strip()[:50].strip()
-    return f"{clean}_{aweme_id}.mp4" if clean else f"{aweme_id}.mp4"
+    nick = INVALID_FN_RE.sub(" ", author or "").strip()[:24].strip()
+    if not clean:
+        clean = nick.lstrip("@")
+        nick = ""
+    parts = [p for p in (clean, f"@{nick}" if nick else "",
+                         str(aweme_id)) if p]
+    return "_".join(parts) + ".mp4"
 
 
 # ---------- 网络层 ----------
@@ -270,7 +279,8 @@ def _via_browser(s, aweme_id: str, out_dir: Path, name_prefix: str) -> Path:
     """
     print("  (切换浏览器兜底路线…)", flush=True)
     fb = resolve_via_browser(aweme_id)
-    dest = out_dir / (name_prefix + build_filename(fb["title"], aweme_id))
+    dest = out_dir / (name_prefix + build_filename(fb["title"], aweme_id,
+                                                    fb.get("author", "")))
     if dest.exists():
         print(f"已存在，跳过: {dest}")
         record_manifest(out_dir, dest.name, fb["title"], fb["author"],
@@ -328,7 +338,8 @@ def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
             return _via_browser(s, aweme_id, out_dir, name_prefix)
         info = parse_item(item)
         dest = out_dir / (name_prefix +
-                          build_filename(info["title"], aweme_id))
+                          build_filename(info["title"], aweme_id,
+                                         info.get("author", "")))
         if dest.exists():
             print(f"已存在，跳过: {dest}")
             record_manifest(out_dir, dest.name, info["title"],
@@ -544,6 +555,16 @@ def test_build_filename_cleans_and_truncates():
 
 def test_build_filename_keeps_normal_title():
     assert build_filename("普通的标题", "123") == "普通的标题_123.mp4"
+
+
+def test_build_filename_with_author():
+    assert build_filename("标题A", "123", "阿刀Al短剧") == \
+        "标题A_@阿刀Al短剧_123.mp4"
+    # 作者名清洗非法字符；ID 恒在末尾
+    assert build_filename('t"t', "456", '作/者:名') == \
+        't t_@作 者 名_456.mp4'
+    # 空标题时用作者名兜底（作标题，不带@）
+    assert build_filename("", "789", "某人") == "某人_789.mp4"
 
 
 def test_build_filename_fallback_id_only():
