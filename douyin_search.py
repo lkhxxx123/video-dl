@@ -111,7 +111,7 @@ def author_blocked(item: dict, keywords):
 
 
 def parse_mix_response(payload: dict, seen: set):
-    """mix/aweme 合集接口响应 → 新增集条目 [{aweme_id,title,ep}]。"""
+    """mix/series 接口响应 → 新增集条目 [{aweme_id,title,ep,ct}]。"""
     out = []
     for e in payload.get("aweme_list") or []:
         aid = e.get("aweme_id")
@@ -120,8 +120,23 @@ def parse_mix_response(payload: dict, seen: set):
         seen.add(aid)
         mix = e.get("mix_info") or {}
         out.append({"aweme_id": aid, "title": e.get("desc") or "",
-                    "ep": mix.get("current_episode") or 0})
+                    "ep": mix.get("current_episode") or 0,
+                    "ct": e.get("create_time") or 0})
     return out
+
+
+def sort_episodes(items):
+    """剧集排序：有官方集数按集数升序；否则按发布时间升序（返回新列表）。"""
+    if any(it.get("ep") for it in items):
+        return sorted(items, key=lambda x: (x.get("ep") or 0,
+                                            x.get("ct") or 0))
+    return sorted(items, key=lambda x: x.get("ct") or 0)
+
+
+def episode_prefix(n: int, total: int) -> str:
+    """集数文件名前缀：零填充保证资源管理器按名排序即观看顺序。"""
+    width = max(2, len(str(max(total, 1))))
+    return f"{n:0{width}d}_"
 
 
 def is_verify_block(payload: dict) -> bool:
@@ -492,7 +507,7 @@ def collect_mix(video_id: str):
         if total and len(items) < total:
             print(f"  ⚠ 剧集只拿到 {len(items)}/{total} 集（翻页未完成）",
                   flush=True)
-        items.sort(key=lambda x: x.get("ep") or 0)
+        items = sort_episodes(items)
         return items
 
 
@@ -704,6 +719,23 @@ def test_parse_mix_response():
     assert {(g["aweme_id"], g["ep"]) for g in got} == \
         {("111", 2), ("222", 1), ("333", 0)}
     assert parse_mix_response(payload, seen) == []
+
+
+def test_sort_episodes_and_prefix():
+    # 有官方集数 → 按集数升序
+    eps = [{"ep": 3, "ct": 1, "aweme_id": "C"},
+           {"ep": 1, "ct": 9, "aweme_id": "A"},
+           {"ep": 2, "ct": 5, "aweme_id": "B"}]
+    assert [e["aweme_id"] for e in sort_episodes(eps)] == ["A", "B", "C"]
+    # 无集数 → 按发布时间升序
+    eps2 = [{"ep": 0, "ct": 30, "aweme_id": "Z"},
+            {"ep": 0, "ct": 10, "aweme_id": "X"},
+            {"ep": 0, "ct": 20, "aweme_id": "Y"}]
+    assert [e["aweme_id"] for e in sort_episodes(eps2)] == ["X", "Y", "Z"]
+    # 前缀零填充：两位数总量补两位，三位补三位
+    assert episode_prefix(7, 34) == "07_"
+    assert episode_prefix(7, 120) == "007_"
+    assert episode_prefix(34, 34) == "34_"
 
 
 # ---------- tests: 主页作品与 series 响应 ----------

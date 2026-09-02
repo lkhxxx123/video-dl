@@ -199,9 +199,11 @@ def download_mix(video_id: str, judge: bool, api_key: str = "",
     ok = failed = 0
     for j, ep in enumerate(eps, 1):
         evid = ep["aweme_id"]
-        print(f"\n第{j}集: {ep['title'][:30]}")
+        prefix = douyin_search.episode_prefix(ep.get("ep") or j, len(eps))
+        print(f"\n第{ep.get('ep') or j}集: {ep['title'][:30]}")
         try:
-            douyin_dl.run(f"https://www.douyin.com/video/{evid}", sdir)
+            douyin_dl.run(f"https://www.douyin.com/video/{evid}", sdir,
+                          name_prefix=prefix)
             ok += 1
         except Exception as e:  # noqa: BLE001
             print(f"  下载失败: {e}")
@@ -269,16 +271,18 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
                 if v.get("verdict") == "clean")
     print(f"\n起点: 干净 {clean}/{target}，历史已处理 {len(done_ids)} 条")
 
-    def process(vid, title, dest_dir=None):
+    def process(vid, title, dest_dir=None, name_prefix=""):
         """下载单条 + AI 验水印 + 分流/计数。返回 clean/watermarked/skip/error。
 
         dest_dir: 指定下载目录（剧集分集存分类子目录时使用），默认主目录。
+        name_prefix: 剧集集数前缀（如 '07_'），保证文件夹内按名排序即观看顺序。
         """
         nonlocal clean
         dest_dir = dest_dir or out_dir
         d_quarantine = dest_dir / "疑似水印"
         try:
-            douyin_dl.run(f"https://www.douyin.com/video/{vid}", dest_dir)
+            douyin_dl.run(f"https://www.douyin.com/video/{vid}", dest_dir,
+                          name_prefix=name_prefix)
         except douyin_dl.ParseError as e:
             print(f"  跳过（下载）: {e}")
             state["processed"][vid] = {"verdict": "skip", "desc": str(e)}
@@ -322,9 +326,11 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
             done_ids.add(evid)
             if evid in state["processed"]:
                 continue
-            print(f"  -- 第{j}集 [{clean + 1}/{target}] "
+            prefix = douyin_search.episode_prefix(ep.get("ep") or j,
+                                                   len(eps))
+            print(f"  -- 第{ep.get('ep') or j}集 [{clean + 1}/{target}] "
                   f"{ep['title'][:24]}", flush=True)
-            process(evid, ep["title"], sdir)
+            process(evid, ep["title"], sdir, name_prefix=prefix)
         print(f"  ⚑ 剧集完成（本部共 {len(eps)} 集）")
 
     while clean < target:

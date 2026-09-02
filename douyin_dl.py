@@ -265,7 +265,8 @@ def resolve_via_browser(aweme_id: str) -> dict:
 
 # ---------- 编排 ----------
 
-def run(text: str, out_dir: Path) -> Path:
+def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
+    """下载视频；name_prefix 用于剧集集数前缀（如 '07_'）保证排序。"""
     url = extract_share_url(text)
     if not url:
         raise ParseError("没有识别到抖音链接，请粘贴完整分享口令")
@@ -293,7 +294,8 @@ def run(text: str, out_dir: Path) -> Path:
             # 分享页被风控 → 浏览器兜底路线（拦 detail 接口拿无水印直链）
             print("  (分享页被风控，切换浏览器兜底路线…)", flush=True)
             fb = resolve_via_browser(aweme_id)
-            dest = out_dir / build_filename(fb["title"], aweme_id)
+            dest = out_dir / (name_prefix +
+                              build_filename(fb["title"], aweme_id))
             if dest.exists():
                 print(f"已存在，跳过: {dest}")
                 record_manifest(out_dir, dest.name, fb["title"],
@@ -319,7 +321,8 @@ def run(text: str, out_dir: Path) -> Path:
             print(f"已保存: {dest}")
             return dest
         info = parse_item(item)
-        dest = out_dir / build_filename(info["title"], aweme_id)
+        dest = out_dir / (name_prefix +
+                          build_filename(info["title"], aweme_id))
         if dest.exists():
             print(f"已存在，跳过: {dest}")
             record_manifest(out_dir, dest.name, info["title"],
