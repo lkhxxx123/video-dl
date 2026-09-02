@@ -94,31 +94,45 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
     print(f"起点: 已处理 {len(done_ids)} 条")
 
     # 收集池放大 4 倍——带合集标记的候选通常只占少数
-    print(f"\n=== 精选搜索（目标 {limit} 部剧）===")
+    print(f"\n=== 精选搜索（目标新下载 {limit} 部剧）===")
     pool = douyin_search.collect_many(keywords, limit * 4, *filters,
                                       seen=done_ids,
                                       block_keywords=block_keywords,
                                       prefer_jingxuan=True)
-    series_list, total_found = pick_series(pool, limit)
-    print(f"\n候选中带合集标记: {total_found} 部 → 处理 {len(series_list)} 部")
-    if not series_list:
+    series_all, total_found = pick_series(pool, 10 ** 6)
+    print(f"\n候选中带合集标记: {total_found} 部（已完整的自动跳过，不占配额）")
+    if not series_all:
         print("!! 没有带合集标记的候选（可放宽点赞阈值或换关键词）")
         return
 
     stat = {"clean": 0, "wm": 0, "skip_done": 0}
     n_new = 0
-    for i, it in enumerate(series_list, 1):
+    for i, it in enumerate(series_all, 1):
+        if n_new >= limit:
+            break
         name = it.get("mix_name") or (it["title"][:20] or "未命名剧集")
-        print(f"\n=== 剧集 [{i}/{len(series_list)}] {name[:24]} ===")
+        print(f"\n=== 剧集 [候选{i}] {name[:24]} ===")
         if it.get("sec_uid"):
             print(f"作者: {it.get('nick') or '?'}  "
                   f"主页: https://www.douyin.com/user/{it['sec_uid']}")
+        print(f"入口视频: {it['aweme_id']}")
         try:
             eps = douyin_search.collect_mix(
                 it["aweme_id"], sec_uid=it.get("sec_uid") or "")
         except douyin_search.SearchError as e:
             print(f"  !! 拉全集失败: {e}")
             continue
+        # 翻页偶发不全：拉到的全已下载且数量偏少 → 重拉一次取更全结果
+        if (eps and len(eps) < 8
+                and all(ep["aweme_id"] in done_ids for ep in eps)):
+            print("  ↳ 疑似翻页不全，重拉一次…", flush=True)
+            try:
+                eps2 = douyin_search.collect_mix(
+                    it["aweme_id"], sec_uid=it.get("sec_uid") or "")
+            except douyin_search.SearchError:
+                eps2 = []
+            if len(eps2) > len(eps):
+                eps = eps2
         if len(eps) < 2:
             print("  ↳ 只拿到 1 集（非完整剧集），跳过")
             continue
@@ -126,7 +140,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         cont, why = douyin_search.looks_continuous(eps)
         print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
         if all(ep["aweme_id"] in done_ids for ep in eps):
-            print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过")
+            print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
             stat["skip_done"] += 1
             continue
         # 已按集数升序（无集数按发布时间）—— 从第 1 集开始
