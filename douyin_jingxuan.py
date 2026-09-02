@@ -120,7 +120,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         try:
             eps = douyin_search.collect_mix(
                 it["aweme_id"], sec_uid=it.get("sec_uid") or "",
-                mix_id=it.get("mix_id") or "")
+                mix_id=it.get("mix_id") or "",
+                mix_name=it.get("mix_name") or "")
         except douyin_search.SearchError as e:
             print(f"  !! 拉全集失败: {e}")
             continue
@@ -131,7 +132,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             try:
                 eps2 = douyin_search.collect_mix(
                     it["aweme_id"], sec_uid=it.get("sec_uid") or "",
-                    mix_id=it.get("mix_id") or "")
+                    mix_id=it.get("mix_id") or "",
+                    mix_name=it.get("mix_name") or "")
             except douyin_search.SearchError:
                 eps2 = []
             if len(eps2) > len(eps):

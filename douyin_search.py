@@ -433,10 +433,11 @@ def collect_many(keywords, limit, max_followers=None, max_duration=None,
     return merged[:limit]
 
 
-def _compilation_url(sec_uid: str, video_id: str) -> str:
-    """作者主页合集子标签 URL（用户实测指认：完整分集列表带第几集标记）。"""
+def _compilation_url(sec_uid: str) -> str:
+    """作者主页合集子标签 URL（不带 modal_id——modal 是视频播放流，滚它会
+    滚进推荐流且从中段集数回不到第 1 集；要的是合集列表视图）。"""
     return (f"https://www.douyin.com/user/{sec_uid}"
-            f"?modal_id={video_id}&showSubTab=compilation&showTab=post")
+            f"?showSubTab=compilation&showTab=post")
 
 
 def _episode_collection_id(url: str):
@@ -445,14 +446,14 @@ def _episode_collection_id(url: str):
     return m.group(1) if m else None
 
 
-def collect_mix(video_id: str, sec_uid: str = "", mix_id=""):
-    """打开作者主页合集页收集指定合集的全部集。
+def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
+    """进作者主页合集标签，点开目标合集列表，收集该合集全部集（从第 1 集）。
 
-    实测(2026-09-02)：完整分集列表在作者主页 compilation 子标签
-    /user/{sec_uid}?modal_id={video}&showSubTab=compilation&showTab=post；
-    页面滚过本合集末尾会加载作者其他内容——必须按 mix_id/series_id
-    过滤拦截到的响应，否则混入其他合集的视频。
-    mix_id 未提供时从首个剧集接口响应学习（modal 指定视频所属合集先到）。
+    实测(2026-09-02，用户指认)：
+    - modal_id 形态打开的是视频播放流，会滚进推荐流且回不到第 1 集；
+    - 正确入口是 /user/{sec_uid}?showSubTab=compilation 的合集列表，
+      点击目标合集（按名称）后是从第 1 集开始的完整分集列表。
+    按 mix_id/series_id 过滤拦截响应，防混入其他合集。
     返回按集数升序的 [{aweme_id, title, ep}]；非剧集或无数据抛 SearchError。
     """
     target = str(mix_id) if mix_id else ""
@@ -501,8 +502,7 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id=""):
         page.on("response", on_response)
         try:
             if state["sec_uid"]:
-                page.goto(_compilation_url(state["sec_uid"], video_id),
-                          timeout=30000)
+                page.goto(_compilation_url(state["sec_uid"]), timeout=30000)
             else:
                 page.goto(f"https://www.douyin.com/video/{video_id}",
                           timeout=30000)
@@ -510,9 +510,52 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id=""):
                 while time.time() < deadline and not state["sec_uid"]:
                     page.wait_for_timeout(1500)
                 if state["sec_uid"]:
-                    page.goto(_compilation_url(state["sec_uid"], video_id),
+                    page.goto(_compilation_url(state["sec_uid"]),
                               timeout=30000)
             _wait_captcha(page)
+            # 点开目标合集卡片 → 从第 1 集开始的完整分集列表
+            # 实测: "更新至N集"是叶子节点, 剧名在同级元素——须用 JS 找
+            # "包含剧名的卡片容器"点击(顺带绕开遮挡); 卡片带权威总集数
+            target_total = None
+            clicked_name = None
+            if mix_name:
+                deadline = time.time() + 15
+                while time.time() < deadline and not clicked_name:
+                    res = page.evaluate(
+                        """(name) => {
+                            const leaves = [...document.querySelectorAll('*')]
+                              .filter(el => el.children.length === 0 &&
+                                     (el.textContent || '')
+                                     .includes('更新至'));
+                            for (const leaf of leaves) {
+                                let el = leaf;
+                                for (let i = 0; i < 8 && el; i++) {
+                                    const t = el.innerText || '';
+                                    if (t.includes(name)) {
+                                        el.click();
+                                        return t.replace(/\\n/g, ' ')
+                                                 .slice(0, 80);
+                                    }
+                                    el = el.parentElement;
+                                }
+                            }
+                            return null;
+                        }""", mix_name)
+                    if res:
+                        clicked_name = res
+                        m = re.search(r"更新至\s*(\d+)\s*集", res)
+                        if m:
+                            target_total = int(m.group(1))
+                    else:
+                        page.wait_for_timeout(1500)
+                if clicked_name:
+                    print(f"  (已点开合集卡片: {clicked_name[:50]})",
+                          flush=True)
+                else:
+                    print("  (未找到合集卡片，按当前列表收集)", flush=True)
+                if target_total and (state["total"] or 0) < target_total:
+                    state["total"] = target_total  # 卡片"更新至N集"权威
+                page.wait_for_timeout(2500)
             # 等首个剧集接口响应
             deadline = time.time() + 20
             while time.time() < deadline and not items:
