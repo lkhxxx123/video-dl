@@ -447,19 +447,29 @@ def _episode_collection_id(url: str):
 
 
 def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
-    """经作者作品流收集目标合集全部集（实测最可靠路径）。
+    """用户指认的标准流程收集合集全部集。
 
-    实测(2026-09-02)：series/aweme 接口只返回观看窗口附近几条(has_more=0)，
-    合集卡片/播放页列表懒加载难触发；作者作品流(aweme/post)可翻到底且
-    每条作品带所属合集/系列 ID —— 按目标 ID 过滤即得完整分集，
-    按发布时间升序（从第 1 集开始）。mix_name 仅为兼容旧签名，不再使用。
+    ① 作者主页合集标签(showSubTab=compilation)
+    ② 点开目标短剧卡片 → 短剧页(user?modal_id=xxx)，展示当前短剧所有剧集
+    ③ 拦截剧集接口(mix/series)，按合集ID过滤，滚动(窗口+内部容器)翻页拉全，
+       以卡片"更新至N集"为完成度校验
+    ④ 兜底：作者作品流按合集ID分组（懒加载偶发卡壳，尽力而为）
+    返回按集数/发布时间升序的 [{aweme_id, title, ep, ct}]。
     """
     target = str(mix_id) if mix_id else ""
+
+    def _learn_or_filter(url, state):
+        cid = _episode_collection_id(url)
+        if state["target"]:
+            return not cid or cid == state["target"]
+        if cid:
+            state["target"] = cid
+        return True
+
     with open_browser() as context:
         page = _first_page(context)
         ensure_login(context, page)
         if not sec_uid:
-            # 无 sec_uid：先开视频页从 detail 接口抓作者与合集 ID
             got = {}
 
             def on_detail(r):
@@ -480,27 +490,128 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
                 page.remove_listener("response", on_detail)
             d = got.get("d") or {}
             sec_uid = (d.get("author") or {}).get("sec_uid") or ""
-            if not target:
-                m = (d.get("mix_info")
-                     or (d.get("author") or {}).get("mix_info") or {})
-                si = d.get("series_info") or {}
-                target = str(m.get("mix_id") or si.get("series_id") or "")
             if not sec_uid:
                 raise SearchError("无法获取作者 sec_uid")
+
+        # ① 合集标签页
+        page.goto(f"https://www.douyin.com/user/{sec_uid}"
+                  "?showSubTab=compilation&showTab=post", timeout=30000)
+        _wait_captcha(page)
+        # ② 点开目标短剧卡片（"更新至N集"叶子向上爬到含剧名的容器）
+        card_total = None
+        if mix_name:
+            deadline = time.time() + 15
+            clicked = None
+            while time.time() < deadline and not clicked:
+                clicked = page.evaluate(
+                    """(name) => {
+                        const leaves = [...document.querySelectorAll('*')]
+                          .filter(el => el.children.length === 0 &&
+                                 (el.textContent || '')
+                                 .includes('更新至'));
+                        for (const leaf of leaves) {
+                            let el = leaf;
+                            for (let i = 0; i < 8 && el; i++) {
+                                const t = el.innerText || '';
+                                if (t.includes(name)) {
+                                    el.click();
+                                    return t.replace(/\n/g, ' ')
+                                             .slice(0, 80);
+                                }
+                                el = el.parentElement;
+                            }
+                        }
+                        return null;
+                    }""", mix_name)
+                if not clicked:
+                    page.wait_for_timeout(1500)
+            if clicked:
+                print(f"  (已进入短剧页: {clicked[:50]})", flush=True)
+                m = re.search(r"更新至\s*(\d+)\s*集", clicked)
+                if m:
+                    card_total = int(m.group(1))
+            else:
+                print("  (未找到合集卡片)", flush=True)
+            page.wait_for_timeout(2500)
+
+        # ③ 短剧页拦截剧集接口，滚动拉全
+        state = {"target": target, "total": card_total}
+        seen, items = set(), []
+
+        def on_response(resp):
+            if not any(s in resp.url for s in EPISODE_URL_SUBSTRS):
+                return
+            if not _learn_or_filter(resp.url, state):
+                return
+            payload = resp_json(resp)
+            if payload is None:
+                return
+            try:
+                fresh = parse_mix_response(payload, seen)
+            except Exception:
+                return
+            if fresh:
+                items.extend(fresh)
+                print(f"  (+{len(fresh)} 集, 累计 {len(items)})", flush=True)
+
+        page.on("response", on_response)
+        try:
+            deadline = time.time() + 20
+            while time.time() < deadline and not items:
+                page.wait_for_timeout(1500)
+            idle = 0
+            while idle < 15:
+                if state["total"] and len(items) >= state["total"]:
+                    break
+                before = len(items)
+                try:
+                    page.evaluate(
+                        "window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
+                try:
+                    page.evaluate(
+                        """() => {
+                            for (const el of document.querySelectorAll('*')) {
+                                const s = getComputedStyle(el);
+                                if ((s.overflowY === 'auto' ||
+                                     s.overflowY === 'scroll') &&
+                                    el.scrollHeight >
+                                        el.clientHeight + 50) {
+                                    el.scrollTop = el.scrollHeight;
+                                }
+                            }
+                        }""")
+                except Exception:
+                    pass
+                page.mouse.wheel(0, 2000)
+                page.wait_for_timeout(1800)
+                idle = 0 if len(items) > before else idle + 1
+        finally:
+            page.remove_listener("response", on_response)
+        if state["total"] and len(items) < state["total"]:
+            print(f"  ⚠ 短剧页只拿到 {len(items)}/{state['total']} 集，"
+                  f"转作品流兜底", flush=True)
+        if len(items) >= 2:
+            if state["total"]:
+                print(f"  (短剧页拿到 {len(items)}/{state['total']} 集)",
+                      flush=True)
+            return sort_episodes(items)
+
+        # ④ 兜底：作者作品流按合集ID分组
         page.goto(f"https://www.douyin.com/user/{sec_uid}", timeout=30000)
         posts, _ = _collect_posts_in_page(page)
-        if not target:
+        if not state["target"]:
             entry = next((p for p in posts if p["aweme_id"] == video_id),
                          None)
             if entry and entry.get("sid"):
-                target = entry["sid"]
-        eps = [p for p in posts if p.get("sid") and p["sid"] == target]
+                state["target"] = entry["sid"]
+        eps = [p for p in posts
+               if p.get("sid") and p["sid"] == state["target"]]
         if not eps:
             raise SearchError(
-                f"作品流中未找到该合集分集（目标ID={target or '?'},"
-                f" 作者作品 {len(posts)} 条）")
-        print(f"  (作品流分组: 合集 {target} 共 {len(eps)} 集 / "
-              f"作者作品 {len(posts)} 条)", flush=True)
+                f"短剧页与作品流均未拿到分集（目标={state['target'] or '?'}）")
+        print(f"  (作品流兜底分组: {len(eps)} 集)", flush=True)
         return [{"aweme_id": p["aweme_id"], "title": p["title"],
                  "ep": 0, "ct": p["create_time"]} for p in eps]
 

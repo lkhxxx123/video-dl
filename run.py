@@ -123,11 +123,11 @@ def main():
             sys.exit(1)
         return
     if mode in ("jx", "jingxuan"):
-        import douyin_jingxuan
+        import douyin_jx
         if not rest:
             rest = [DEFAULT_KEYWORDS] + DEFAULT_SEARCH_ARGS
         need_key(rest)
-        douyin_jingxuan.main(rest)
+        douyin_jx.main(rest)
         return
     if mode == "auto":
         import douyin_auto
