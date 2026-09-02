@@ -447,223 +447,152 @@ def _episode_collection_id(url: str):
 
 
 def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
-    """进作者主页合集标签，点开目标合集列表，收集该合集全部集（从第 1 集）。
+    """经作者作品流收集目标合集全部集（实测最可靠路径）。
 
-    实测(2026-09-02，用户指认)：
-    - modal_id 形态打开的是视频播放流，会滚进推荐流且回不到第 1 集；
-    - 正确入口是 /user/{sec_uid}?showSubTab=compilation 的合集列表，
-      点击目标合集（按名称）后是从第 1 集开始的完整分集列表。
-    按 mix_id/series_id 过滤拦截响应，防混入其他合集。
-    返回按集数升序的 [{aweme_id, title, ep}]；非剧集或无数据抛 SearchError。
+    实测(2026-09-02)：series/aweme 接口只返回观看窗口附近几条(has_more=0)，
+    合集卡片/播放页列表懒加载难触发；作者作品流(aweme/post)可翻到底且
+    每条作品带所属合集/系列 ID —— 按目标 ID 过滤即得完整分集，
+    按发布时间升序（从第 1 集开始）。mix_name 仅为兼容旧签名，不再使用。
     """
     target = str(mix_id) if mix_id else ""
     with open_browser() as context:
         page = _first_page(context)
         ensure_login(context, page)
-        seen, items = set(), []
-        state = {"has_more": True, "total": None, "sec_uid": sec_uid,
-                 "target": target}
+        if not sec_uid:
+            # 无 sec_uid：先开视频页从 detail 接口抓作者与合集 ID
+            got = {}
 
-        def on_response(resp):
-            url = resp.url
-            if any(s in url for s in EPISODE_URL_SUBSTRS):
-                url_cid = _episode_collection_id(url)
-                if state["target"]:
-                    if url_cid and url_cid != state["target"]:
-                        return  # 其他合集/作者其他内容，忽略
-                elif url_cid:
-                    state["target"] = url_cid  # 从首个响应学习目标合集
-                    print(f"  (目标合集ID: {url_cid})", flush=True)
-                payload = resp_json(resp)
-                if payload is None:
-                    return
-                if payload.get("has_more") == 0:
-                    state["has_more"] = False
-                for key in ("total", "episode_count"):
-                    v = payload.get(key)
-                    if isinstance(v, int) and v > (state["total"] or 0):
-                        state["total"] = v
-                try:
-                    items.extend(parse_mix_response(payload, seen))
-                except Exception:
-                    return
-            elif "/aweme/v1/web/aweme/detail/" in url:
-                payload = resp_json(resp)
-                if payload:
-                    data = payload.get("aweme_detail") or payload
-                    mix = data.get("mix_info") or {}
-                    ec = mix.get("episode_count")
-                    if isinstance(ec, int):
-                        state["total"] = ec
-                    su = (data.get("author") or {}).get("sec_uid")
-                    if su:
-                        state["sec_uid"] = su
+            def on_detail(r):
+                if "/aweme/v1/web/aweme/detail/" in r.url:
+                    p = resp_json(r)
+                    if p:
+                        got["d"] = p.get("aweme_detail") or p
 
-        page.on("response", on_response)
-        try:
-            if state["sec_uid"]:
-                page.goto(_compilation_url(state["sec_uid"]), timeout=30000)
-            else:
+            page.on("response", on_detail)
+            try:
                 page.goto(f"https://www.douyin.com/video/{video_id}",
                           timeout=30000)
+                _wait_captcha(page)
                 deadline = time.time() + 20
-                while time.time() < deadline and not state["sec_uid"]:
+                while time.time() < deadline and "d" not in got:
                     page.wait_for_timeout(1500)
-                if state["sec_uid"]:
-                    page.goto(_compilation_url(state["sec_uid"]),
-                              timeout=30000)
-            _wait_captcha(page)
-            # 点开目标合集卡片 → 从第 1 集开始的完整分集列表
-            # 实测: "更新至N集"是叶子节点, 剧名在同级元素——须用 JS 找
-            # "包含剧名的卡片容器"点击(顺带绕开遮挡); 卡片带权威总集数
-            target_total = None
-            clicked_name = None
-            if mix_name:
-                deadline = time.time() + 15
-                while time.time() < deadline and not clicked_name:
-                    res = page.evaluate(
-                        """(name) => {
-                            const leaves = [...document.querySelectorAll('*')]
-                              .filter(el => el.children.length === 0 &&
-                                     (el.textContent || '')
-                                     .includes('更新至'));
-                            for (const leaf of leaves) {
-                                let el = leaf;
-                                for (let i = 0; i < 8 && el; i++) {
-                                    const t = el.innerText || '';
-                                    if (t.includes(name)) {
-                                        el.click();
-                                        return t.replace(/\\n/g, ' ')
-                                                 .slice(0, 80);
-                                    }
-                                    el = el.parentElement;
-                                }
-                            }
-                            return null;
-                        }""", mix_name)
-                    if res:
-                        clicked_name = res
-                        m = re.search(r"更新至\s*(\d+)\s*集", res)
-                        if m:
-                            target_total = int(m.group(1))
-                    else:
-                        page.wait_for_timeout(1500)
-                if clicked_name:
-                    print(f"  (已点开合集卡片: {clicked_name[:50]})",
-                          flush=True)
-                else:
-                    print("  (未找到合集卡片，按当前列表收集)", flush=True)
-                if target_total and (state["total"] or 0) < target_total:
-                    state["total"] = target_total  # 卡片"更新至N集"权威
-                page.wait_for_timeout(2500)
-            # 等首个剧集接口响应
-            deadline = time.time() + 20
-            while time.time() < deadline and not items:
-                page.wait_for_timeout(1500)
-            # 滚动拉全：JS 滚到底(不依赖焦点/坐标) + 模拟滚轮双保险
-            idle = 0
-            while idle < 12:
-                if state["total"] and len(items) >= state["total"]:
-                    break
-                before = len(items)
-                try:
-                    page.evaluate(
-                        "window.scrollTo(0, document.body.scrollHeight)")
-                except Exception:
-                    pass
-                page.mouse.wheel(0, 2000)
-                page.wait_for_timeout(1500)
-                idle = 0 if len(items) > before else idle + 1
-        finally:
-            page.remove_listener("response", on_response)
-        if not items:
-            raise SearchError("未拦截到合集/系列接口（可能不是剧集或触发验证）")
-        total = state["total"]
-        if total and len(items) < total:
-            print(f"  ⚠ 剧集只拿到 {len(items)}/{total} 集（翻页未完成）",
-                  flush=True)
-        elif not total:
-            # 总集数未知时用标题里的最大集号推断，尽量发现截断
-            expected = 0
-            for it in items:
-                hint = series_detect.episode_hint(it.get("title") or "")
-                expected = max(expected, it.get("ep") or 0, hint or 0)
-            if expected > len(items):
-                print(f"  ⚠ 剧集疑似不全：拿到 {len(items)} 集，"
-                      f"但标题集数已达第 {expected} 集", flush=True)
-        items = sort_episodes(items)
-        return items
-
+            finally:
+                page.remove_listener("response", on_detail)
+            d = got.get("d") or {}
+            sec_uid = (d.get("author") or {}).get("sec_uid") or ""
+            if not target:
+                m = (d.get("mix_info")
+                     or (d.get("author") or {}).get("mix_info") or {})
+                si = d.get("series_info") or {}
+                target = str(m.get("mix_id") or si.get("series_id") or "")
+            if not sec_uid:
+                raise SearchError("无法获取作者 sec_uid")
+        page.goto(f"https://www.douyin.com/user/{sec_uid}", timeout=30000)
+        posts, _ = _collect_posts_in_page(page)
+        if not target:
+            entry = next((p for p in posts if p["aweme_id"] == video_id),
+                         None)
+            if entry and entry.get("sid"):
+                target = entry["sid"]
+        eps = [p for p in posts if p.get("sid") and p["sid"] == target]
+        if not eps:
+            raise SearchError(
+                f"作品流中未找到该合集分集（目标ID={target or '?'},"
+                f" 作者作品 {len(posts)} 条）")
+        print(f"  (作品流分组: 合集 {target} 共 {len(eps)} 集 / "
+              f"作者作品 {len(posts)} 条)", flush=True)
+        return [{"aweme_id": p["aweme_id"], "title": p["title"],
+                 "ep": 0, "ct": p["create_time"]} for p in eps]
 
 def parse_post_response(payload: dict, seen: set):
-    """作者主页作品接口 → 新增 [{aweme_id, title, create_time}]。"""
+    """作者主页作品接口 → 新增 [{aweme_id, title, create_time, sid}]。
+
+    sid: 该作品所属合集/系列 ID（series_info.series_id 或 mix_info.mix_id）。
+    """
     out = []
     for e in payload.get("aweme_list") or []:
         aid = e.get("aweme_id")
         if not aid or aid in seen:
             continue
         seen.add(aid)
+        sid = ((e.get("series_info") or {}).get("series_id")
+               or (e.get("mix_info") or {}).get("mix_id") or "")
         out.append({"aweme_id": aid, "title": e.get("desc") or "",
-                    "create_time": e.get("create_time") or 0})
+                    "create_time": e.get("create_time") or 0,
+                    "sid": str(sid)})
     return out
+
+
+def _collect_posts_in_page(page, max_scrolls=120):
+    """在已打开的作者主页页面上拦截作品接口并滚动翻完。
+
+    返回 (items, has_more_flag)；items 为 [{aweme_id,title,create_time,sid}]。
+    """
+    seen, items = set(), []
+    state = {"has_more": True}
+
+    def on_response(resp):
+        if USER_POST_URL_SUBSTR not in resp.url:
+            return
+        payload = resp_json(resp)
+        if payload is None:
+            return
+        if payload.get("has_more") == 0:
+            state["has_more"] = False
+        try:
+            items.extend(parse_post_response(payload, seen))
+        except Exception:
+            return
+
+    page.on("response", on_response)
+    try:
+        _wait_captcha(page)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if items:
+                break
+            page.wait_for_timeout(1500)
+        page.wait_for_timeout(2500)  # 首批到位后先稳一稳再滚(懒加载易漏)
+        # 滚动翻页加载全部作品；has_more=0 停，idle 12 防卡死，封顶防死滚
+        idle = scrolls = 0
+        while state["has_more"] and idle < 12 and scrolls < max_scrolls:
+            before = len(items)
+            try:
+                page.evaluate(
+                    "window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+            page.mouse.wheel(0, 2000)
+            page.wait_for_timeout(1800)
+            idle = 0 if len(items) > before else idle + 1
+            scrolls += 1
+    finally:
+        page.remove_listener("response", on_response)
+    items.sort(key=lambda x: x["create_time"] or 10 ** 12)
+    return items, state["has_more"]
 
 
 def collect_user_posts(sec_uid: str, screenshot_to=None, max_scrolls=120):
     """打开作者主页，拦截 /aweme/v1/web/aweme/post/ 收集全部作品。
 
-    返回按发布时间升序 [{aweme_id, title, create_time}]（无时间的排末尾）；
+    返回按发布时间升序 [{aweme_id, title, create_time, sid}]（无时间的排末尾）；
     screenshot_to: 可选 Path，回顶后截主页图（剧集判定的辅助证据）。
     翻页以响应 has_more=0 为准（实测(2026-09)懒加载较慢，需高耐心阈值）。
     """
     with open_browser() as context:
         page = _first_page(context)
         ensure_login(context, page)
-        seen, items = set(), []
-        state = {"has_more": True}
-
-        def on_response(resp):
-            if USER_POST_URL_SUBSTR not in resp.url:
-                return
-            payload = resp_json(resp)
-            if payload is None:
-                return
-            if payload.get("has_more") == 0:
-                state["has_more"] = False
+        page.goto(f"https://www.douyin.com/user/{sec_uid}", timeout=30000)
+        if screenshot_to:
             try:
-                items.extend(parse_post_response(payload, seen))
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(1200)
+                page.screenshot(path=str(screenshot_to))
             except Exception:
-                return
-
-        page.on("response", on_response)
-        try:
-            page.goto(f"https://www.douyin.com/user/{sec_uid}",
-                      timeout=30000)
-            _wait_captcha(page)
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                if items:
-                    break
-                page.wait_for_timeout(1500)
-            # 滚动翻页加载全部作品；has_more=0 停，idle 8 防卡死，封顶防死滚
-            idle = scrolls = 0
-            while state["has_more"] and idle < 8 and scrolls < max_scrolls:
-                before = len(items)
-                page.mouse.wheel(0, 2000)
-                page.wait_for_timeout(2000)
-                idle = 0 if len(items) > before else idle + 1
-                scrolls += 1
-            if screenshot_to:
-                try:
-                    page.evaluate("window.scrollTo(0, 0)")
-                    page.wait_for_timeout(1200)
-                    page.screenshot(path=str(screenshot_to))
-                except Exception:
-                    pass
-        finally:
-            page.remove_listener("response", on_response)
+                pass
+        items, _ = _collect_posts_in_page(page, max_scrolls)
         if not items:
             raise SearchError("未拦截到主页作品接口（可能触发验证）")
-        items.sort(key=lambda x: x["create_time"] or 10 ** 12)
         return items
 
 
@@ -865,20 +794,28 @@ def test_parse_mix_response_series_shape():
 
 def test_parse_post_response():
     payload = {"aweme_list": [
-        {"aweme_id": "111", "desc": "旧作", "create_time": 1779000001},
-        {"aweme_id": "222", "desc": "新作", "create_time": 1779000002},
+        {"aweme_id": "111", "desc": "旧作", "create_time": 1779000001,
+         "series_info": {"series_id": 999}},
+        {"aweme_id": "222", "desc": "新作", "create_time": 1779000002,
+         "mix_info": {"mix_id": 555}},
         {"aweme_id": "111", "desc": "重复"},
         {"aweme_id": "333", "desc": "无时间"},
     ]}
     seen = set()
     got = parse_post_response(payload, seen)
     assert got == [
-        {"aweme_id": "111", "title": "旧作", "create_time": 1779000001},
-        {"aweme_id": "222", "title": "新作", "create_time": 1779000002},
-        {"aweme_id": "333", "title": "无时间", "create_time": 0},
+        {"aweme_id": "111", "title": "旧作", "create_time": 1779000001,
+         "sid": "999"},
+        {"aweme_id": "222", "title": "新作", "create_time": 1779000002,
+         "sid": "555"},
+        {"aweme_id": "333", "title": "无时间", "create_time": 0,
+         "sid": ""},
     ]
     assert parse_post_response(payload, seen) == []
     assert parse_post_response({}, set()) == []
+    # 按所属合集分组
+    sids = {p["sid"] for p in got}
+    assert sids == {"999", "555", ""}
 
 
 def test_parse_search_response_legacy_data_shape():
