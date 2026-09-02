@@ -179,18 +179,14 @@ def safe_dir_name(name: str) -> str:
 
 
 def make_dated_dir(root: Path) -> Path:
-    """按日期建目录 downloads/YYYY-MM-DD；已存在则 -1/-2…（每次运行新目录）。"""
-    today = time.strftime("%Y-%m-%d")
-    cand = root / today
-    if not cand.exists():
-        cand.mkdir(parents=True)
-        return cand
-    for i in range(1, 1000):
-        c = root / f"{today}-{i}"
-        if not c.exists():
-            c.mkdir(parents=True)
-            return c
-    raise SearchError("无法生成日期目录")
+    """按日期建目录 downloads/YYYY-MM-DD。
+
+    同一天多次运行共用同一目录（数据叠加）——去重由全局 ID 扫描保证，
+    状态文件/视频清单在同日内累积，断点续跑更顺。
+    """
+    d = root / time.strftime("%Y-%m-%d")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def existing_ids_under(root: Path) -> set:
@@ -832,16 +828,15 @@ def test_search_urls_fallback_routes():
 
 # ---------- tests: 日期目录与全局去重 ----------
 
-def test_make_dated_dir_increments():
+def test_make_dated_dir_same_day_reused():
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         d1 = make_dated_dir(root)
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", d1.name), d1.name
-        d2 = make_dated_dir(root)
-        assert d2.name == f"{d1.name}-1", d2.name
-        d3 = make_dated_dir(root)
-        assert d3.name == f"{d1.name}-2", d3.name
+        # 同一天多次运行 → 同一目录（叠加），不再 -1/-2
+        assert make_dated_dir(root) == d1
+        assert len(list(root.iterdir())) == 1
 
 
 def test_existing_ids_under_recursive():
