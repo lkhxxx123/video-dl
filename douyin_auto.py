@@ -189,6 +189,10 @@ def download_mix(video_id: str, judge: bool, api_key: str = "",
             (fb.get("author") or "作者") + "剧集"
     if not eps:
         raise RuntimeError("该视频不属于任何合集/系列，且主页AI识别未命中")
+    if len(eps) < 2:
+        print("↳ 只拿到 1 集（非完整剧集），按单条下载")
+        douyin_dl.run(f"https://www.douyin.com/video/{video_id}", out_dir)
+        return
     sdir = out_dir / "剧集" / douyin_search.safe_dir_name(name or "未命名剧集")
     print(f"剧集: {name or '?'} 共 {len(eps)} 集 → {sdir}")
     quarantine = sdir / "疑似水印"
@@ -354,12 +358,14 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
                 except douyin_search.SearchError as e:
                     print(f"  !! 拉全集失败: {e}")
                     eps = []
-                if eps:
+                if len(eps) >= 2:
                     print(f"  共 {len(eps)} 集，逐集下载+验水印")
                     download_series(eps, it.get("mix_name"))
                     progressed = True
                     continue
-                # 面板接口失败 → 主页AI识别兜底
+                if eps:
+                    print("  ↳ 面板只拿到 1 集（非完整剧集），按单条下载")
+                # 面板接口失败/单集 → 主页AI识别兜底
                 if user_series:
                     eps, sname = series_via_user_page(
                         vid, title, it.get("sec_uid"), out_dir, api_key,

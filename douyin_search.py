@@ -393,61 +393,109 @@ def collect_many(keywords, limit, max_followers=None, max_duration=None,
     return merged[:limit]
 
 
-def collect_mix(video_id: str):
-    """打开视频页，拦截剧集面板接口（合集 mix / 系列 series）收集全部集。
+def _goto_episode_list(page) -> bool:
+    """从视频页进入"剧集列表"整页（或全屏列表），使全部集可滚动翻页。
 
-    返回按集数升序的 [{aweme_id, title, ep}]（系列无集数字段时保持面板顺序）；
-    非剧集或无数据抛 SearchError。
+    实测(2026-09)：视频页面板只预取第一页。策略：
+    ① DOM 里找合集/系列链接直接跳转；② 点击"共N集/合集/系列"入口。
+    返回是否成功切换（失败则留在原页，靠窗口滚动兜底）。
+    """
+    href = page.evaluate(
+        """() => {
+            const pats = [/\\/mix\\//, /collection/i, /\\/series\\//];
+            for (const a of document.querySelectorAll('a[href]')) {
+                if (pats.some(p => p.test(a.href))) return a.href;
+            }
+            return null;
+        }""")
+    if href:
+        try:
+            page.goto(href, timeout=30000)
+            _wait_captcha(page)
+            return True
+        except Exception:
+            pass
+    for pattern in (r"共\s*\d+\s*[集期]", "合集", "系列"):
+        try:
+            loc = page.get_by_text(re.compile(pattern)).first
+            loc.click(timeout=3000)
+            page.wait_for_timeout(2500)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def collect_mix(video_id: str):
+    """进入剧集列表页收集全部集（合集 mix / 系列 series 双拦截）。
+
+    关键(实测 2026-09)：视频页面板只预取第一页（例：34 集只见 6 集），
+    必须进列表页整页滚动才能翻完。以 detail/响应携带的总集数做完成度
+    校验，不足时打印 ⚠，不再静默截断。
+    返回按集数升序的 [{aweme_id, title, ep}]；非剧集或无数据抛 SearchError。
     """
     with open_browser() as context:
         page = _first_page(context)
         ensure_login(context, page)
         seen, items = set(), []
-        state = {"has_more": True}
+        state = {"has_more": True, "total": None}
 
         def on_response(resp):
-            if not any(s in resp.url for s in EPISODE_URL_SUBSTRS):
-                return
-            payload = resp_json(resp)
-            if payload is None:
-                return
-            if payload.get("has_more") == 0:
-                state["has_more"] = False
-            try:
-                items.extend(parse_mix_response(payload, seen))
-            except Exception:
-                return
+            url = resp.url
+            if any(s in url for s in EPISODE_URL_SUBSTRS):
+                payload = resp_json(resp)
+                if payload is None:
+                    return
+                if payload.get("has_more") == 0:
+                    state["has_more"] = False
+                for key in ("total", "episode_count"):
+                    v = payload.get(key)
+                    if isinstance(v, int) and v > (state["total"] or 0):
+                        state["total"] = v
+                try:
+                    items.extend(parse_mix_response(payload, seen))
+                except Exception:
+                    return
+            elif "/aweme/v1/web/aweme/detail/" in url:
+                payload = resp_json(resp)
+                if payload:
+                    data = payload.get("aweme_detail") or payload
+                    mix = data.get("mix_info") or {}
+                    ec = mix.get("episode_count")
+                    if isinstance(ec, int):
+                        state["total"] = ec
 
         page.on("response", on_response)
         try:
             page.goto(f"https://www.douyin.com/video/{video_id}",
                       timeout=30000)
             _wait_captcha(page)
-            # 等首个剧集接口响应
+            # 等首个剧集接口响应（面板第一页）
             deadline = time.time() + 20
             while time.time() < deadline:
                 if items:
                     break
                 page.wait_for_timeout(1500)
-            # 滚动触发剧集面板分页：页面滚动 + 面板区域悬停滚动交替
-            # （面板有自己的滚动条，只滚窗口拿不到后续页）
+            # 关键：进入剧集列表整页，让全部集可滚动加载
+            if _goto_episode_list(page):
+                page.wait_for_timeout(2000)
+            # 滚动拉全：优先对照总集数，has_more 与空闲计数兜底
             idle = 0
-            while state["has_more"] and idle < 6:
+            while idle < 10:
+                if state["total"] and len(items) >= state["total"]:
+                    break
                 before = len(items)
                 page.mouse.wheel(0, 2000)
                 page.wait_for_timeout(1800)
-                try:
-                    vw = page.viewport_size["width"]
-                    page.mouse.move(vw - 260, 420)
-                    page.mouse.wheel(0, 1500)
-                except Exception:
-                    pass
-                page.wait_for_timeout(1200)
                 idle = 0 if len(items) > before else idle + 1
         finally:
             page.remove_listener("response", on_response)
         if not items:
             raise SearchError("未拦截到合集/系列接口（可能不是剧集或触发验证）")
+        total = state["total"]
+        if total and len(items) < total:
+            print(f"  ⚠ 剧集只拿到 {len(items)}/{total} 集（翻页未完成）",
+                  flush=True)
         items.sort(key=lambda x: x.get("ep") or 0)
         return items
 
