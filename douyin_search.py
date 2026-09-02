@@ -178,14 +178,16 @@ def has_login(cookies) -> bool:
                for c in cookies)
 
 
-def _search_urls(keyword: str):
+def _search_urls(keyword: str, prefer_jingxuan: bool = False):
     """搜索路由优先级：标准 /search/ 为主，精选 /jingxuan/search/ 为兜底。
 
     实测(2026-09)：标准路由偶发 503（风控/抖动），精选路由仍可用。
+    prefer_jingxuan=True 时精选优先（douyin_jingxuan 场景）。
     """
     kw = quote(keyword)
-    return [f"https://www.douyin.com/search/{kw}?type=video",
+    urls = [f"https://www.douyin.com/search/{kw}?type=video",
             f"https://www.douyin.com/jingxuan/search/{kw}"]
+    return urls[::-1] if prefer_jingxuan else urls
 
 
 def safe_dir_name(name: str) -> str:
@@ -286,7 +288,7 @@ def _wait_captcha(page, timeout=90) -> None:
 
 def _collect_page(context, page, keyword, limit, max_followers=None,
                   max_duration=None, max_likes=None, seen=None,
-                  block_keywords=None):
+                  block_keywords=None, prefer_jingxuan=False):
     """单个关键词的搜索收集（在已打开的浏览器页签内跳转）。
 
     成功返回合格列表；验证超时/无数据抛 SearchError（由调用方决定是否继续）。
@@ -329,7 +331,7 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
     try:
         # 路由探测：标准 /search/ 12s 内无数据（含 503）→ 换 jingxuan 兜底
         route = ""
-        for url in _search_urls(keyword):
+        for url in _search_urls(keyword, prefer_jingxuan):
             resp = page.goto(url, timeout=30000)
             route = url.split("/")[3] or "(根)"
             status = resp.status if resp else "?"
@@ -374,7 +376,8 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
 
 
 def collect_many(keywords, limit, max_followers=None, max_duration=None,
-                 max_likes=None, seen=None, block_keywords=None):
+                 max_likes=None, seen=None, block_keywords=None,
+                 prefer_jingxuan=False):
     """多关键词聚合：开一次浏览器，逐词收集，全局去重，凑够 limit 即停。
 
     seen: 额外提供的"已处理 ID 集合"（流水线复用，跳过历史视频）。
@@ -395,7 +398,8 @@ def collect_many(keywords, limit, max_followers=None, max_duration=None,
                 merged.extend(_collect_page(context, page, kw, remaining,
                                             max_followers, max_duration,
                                             max_likes, seen_ids,
-                                            block_keywords))
+                                            block_keywords,
+                                            prefer_jingxuan))
             except SearchError as e:
                 print(f"  !! {e}，跳到下一个关键词", flush=True)
             print(f"累计合格 {len(merged)}/{limit}")
