@@ -548,9 +548,8 @@ def collect_mix(video_id: str):
             # 总集数未知时用标题里的最大集号推断，尽量发现截断
             expected = 0
             for it in items:
-                expected = max(expected, it.get("ep") or 0,
-                               series_detect.episode_hint(
-                                   it.get("title") or ""))
+                hint = series_detect.episode_hint(it.get("title") or "")
+                expected = max(expected, it.get("ep") or 0, hint or 0)
             if expected > len(items):
                 print(f"  ⚠ 剧集疑似不全：拿到 {len(items)} 集，"
                       f"但标题集数已达第 {expected} 集", flush=True)

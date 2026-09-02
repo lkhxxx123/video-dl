@@ -49,11 +49,18 @@ def run_selftests():
 # ---------- 纯逻辑 ----------
 
 def pick_series(pool, limit):
-    """从候选池挑出带合集/系列标记的剧集，截取前 limit 部。
+    """从候选池挑出带合集/系列标记的剧集，按 mix_id 去重后截取前 limit 部。
 
-    返回 (选中列表, 命中总数)。
+    同一合集的多条视频只保留第一条（否则一部剧占多个坑）。
+    返回 (选中列表, 去重后命中总数)。
     """
-    series = [it for it in pool if it.get("mix_id")]
+    seen_mix, series = set(), []
+    for it in pool:
+        mid = it.get("mix_id")
+        if not mid or mid in seen_mix:
+            continue
+        seen_mix.add(mid)
+        series.append(it)
     return series[:limit], len(series)
 
 
@@ -65,13 +72,15 @@ def test_pick_series_only_mix_and_limit():
         {"aweme_id": "2", "mix_id": None},                      # 散视频
         {"aweme_id": "3", "mix_id": 333, "mix_name": "剧B"},
         {"aweme_id": "4", "mix_id": 444, "mix_name": "剧C"},
+        {"aweme_id": "5", "mix_id": 111, "mix_name": "剧A重复"},  # 同合集去重
     ]
     got, total = pick_series(pool, 2)
     assert total == 3
     assert [g["mix_name"] for g in got] == ["剧A", "剧B"]
-    # limit 大于命中数 → 全取
+    # limit 大于命中数 → 全取，且无重复
     got2, total2 = pick_series(pool, 10)
     assert len(got2) == 3 and total2 == 3
+    assert len({g["mix_id"] for g in got2}) == 3
 
 
 # ---------- 编排 ----------
