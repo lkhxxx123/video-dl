@@ -553,9 +553,22 @@ def _collect_posts_in_page(page, max_scrolls=120):
                 break
             page.wait_for_timeout(1500)
         page.wait_for_timeout(2500)  # 首批到位后先稳一稳再滚(懒加载易漏)
-        # 滚动翻页加载全部作品；has_more=0 停，idle 12 防卡死，封顶防死滚
+        # 主页头部"作品 N"总数做硬校验（懒加载偶发卡壳，25/43 截断实例）
+        expected = None
+        try:
+            m = re.search(r"作品\s*[\|｜:]?\s*(\d+)",
+                          page.inner_text("body")[:3000])
+            if m:
+                expected = int(m.group(1))
+                print(f"  (主页作品总数: {expected})", flush=True)
+        except Exception:
+            pass
+        # 滚动翻页加载全部作品；has_more=0 或达主页总数 停；
+        # idle 20 防卡死(懒加载慢)，封顶防死滚
         idle = scrolls = 0
-        while state["has_more"] and idle < 12 and scrolls < max_scrolls:
+        while (state["has_more"] and idle < 20
+               and scrolls < max_scrolls
+               and not (expected and len(items) >= expected)):
             before = len(items)
             try:
                 page.evaluate(
@@ -563,9 +576,12 @@ def _collect_posts_in_page(page, max_scrolls=120):
             except Exception:
                 pass
             page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(1800)
+            page.wait_for_timeout(2000)
             idle = 0 if len(items) > before else idle + 1
             scrolls += 1
+        if expected and len(items) < expected:
+            print(f"  ⚠ 作品流只翻到 {len(items)}/{expected}（懒加载卡壳）",
+                  flush=True)
     finally:
         page.remove_listener("response", on_response)
     items.sort(key=lambda x: x["create_time"] or 10 ** 12)
