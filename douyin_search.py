@@ -186,7 +186,7 @@ def _search_urls(keyword: str, prefer_jingxuan: bool = False):
     """
     kw = quote(keyword)
     urls = [f"https://www.douyin.com/search/{kw}?type=video",
-            f"https://www.douyin.com/jingxuan/search/{kw}"]
+            f"https://www.douyin.com/jingxuan/search/{kw}?type=video"]
     return urls[::-1] if prefer_jingxuan else urls
 
 
@@ -335,14 +335,18 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
             resp = page.goto(url, timeout=30000)
             route = url.split("/")[3] or "(根)"
             status = resp.status if resp else "?"
+            landed = ((resp.url if resp else "?").split("/")[3]
+                      if resp else "?")
             _wait_captcha(page)
             probe_deadline = time.time() + 12
             while raw == 0 and time.time() < probe_deadline:
                 page.wait_for_timeout(1500)
             if raw:
+                extra = f"（被跳转到 {landed}）" if landed != route else ""
+                print(f"  (路由 {route} 命中{extra})", flush=True)
                 break
-            print(f"  (路由 {route} 无数据[HTTP {status}]，切换下一条路由…)",
-                  flush=True)
+            print(f"  (路由 {route} 无数据[HTTP {status}]"
+                  f"实际落点 {landed}，切换下一条路由…)", flush=True)
         # 长等待：等首条有数据的响应；遇软拦截(verify_check)提示用户滑验证。
         # 提示 90s 后仍无数据则刷新页面重发搜索（验证通过后刷新即可拿到）
         first_deadline = time.time() + VERIFY_WAIT
@@ -859,7 +863,10 @@ def test_search_urls_fallback_routes():
     assert urls[0] == ("https://www.douyin.com/search/AI%20%E7%9F%AD%E5%89%A7"
                        "?type=video")
     assert urls[1] == ("https://www.douyin.com/jingxuan/search/"
-                       "AI%20%E7%9F%AD%E5%89%A7")
+                       "AI%20%E7%9F%AD%E5%89%A7?type=video")
+    # 精选优先时顺序反转
+    jx = _search_urls("AI 短剧", prefer_jingxuan=True)
+    assert jx[0].startswith("https://www.douyin.com/jingxuan/")
 
 
 # ---------- tests: 日期目录与全局去重 ----------
