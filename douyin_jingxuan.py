@@ -109,6 +109,12 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         if len(eps) < 2:
             print("  ↳ 只拿到 1 集（非完整剧集），跳过")
             continue
+        # 合集真实性门控：标题混杂的"杂物合集"不下整部
+        cont, why = douyin_search.looks_continuous(eps)
+        if not cont:
+            print(f"  ↳ 合集不像连续剧集（{why}），跳过整部")
+            continue
+        print(f"  连续性校验: {why}")
         if all(ep["aweme_id"] in done_ids for ep in eps):
             print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过")
             stat["skip_done"] += 1

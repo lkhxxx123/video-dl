@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import douyin_dl
+import series_detect
 
 try:
     from playwright.sync_api import sync_playwright
@@ -137,6 +138,26 @@ def episode_prefix(n: int, total: int) -> str:
     """集数文件名前缀：零填充保证资源管理器按名排序即观看顺序。"""
     width = max(2, len(str(max(total, 1))))
     return f"{n:0{width}d}_"
+
+
+def looks_continuous(eps):
+    """合集标题是否像同一部连续剧集（防"杂物合集"误下整部）。
+
+    判据（满足其一）：≥2 个标题带集数标记；或 ≥60% 标题共享前 6 字前缀。
+    返回 (是否连续, 依据说明)。
+    """
+    titles = [(e.get("title") or "").strip() for e in eps]
+    titles = [t.split("#")[0].strip() or t for t in titles]  # 去话题标签
+    if len(titles) < 2:
+        return False, "集数不足 2"
+    hint = sum(1 for t in titles if series_detect.episode_hint(t))
+    if hint >= 2:
+        return True, f"{hint} 个标题带集数标记"
+    prefix = titles[0][:6]
+    same = sum(1 for t in titles if t[:6] == prefix)
+    if same >= max(2, len(titles) * 0.6):
+        return True, f"{same}/{len(titles)} 标题共享前缀「{prefix}」"
+    return False, "标题混杂（无集数标记也无共同前缀）"
 
 
 def is_verify_block(payload: dict) -> bool:
@@ -431,6 +452,7 @@ def _goto_episode_list(page) -> bool:
         try:
             page.goto(href, timeout=30000)
             _wait_captcha(page)
+            print("  (已跳转剧集列表页：面板链接)", flush=True)
             return True
         except Exception:
             pass
@@ -439,9 +461,11 @@ def _goto_episode_list(page) -> bool:
             loc = page.get_by_text(re.compile(pattern)).first
             loc.click(timeout=3000)
             page.wait_for_timeout(2500)
+            print(f"  (已打开剧集列表：点击「{pattern}」入口)", flush=True)
             return True
         except Exception:
             continue
+    print("  (⚠ 未能进入剧集列表页，只有面板第一页)", flush=True)
     return False
 
 
@@ -497,15 +521,20 @@ def collect_mix(video_id: str):
                 page.wait_for_timeout(1500)
             # 关键：进入剧集列表整页，让全部集可滚动加载
             if _goto_episode_list(page):
-                page.wait_for_timeout(2000)
-            # 滚动拉全：优先对照总集数，has_more 与空闲计数兜底
+                page.wait_for_timeout(2500)
+            # 滚动拉全：JS 滚到底(不依赖焦点/坐标) + 模拟滚轮双保险
             idle = 0
-            while idle < 10:
+            while idle < 12:
                 if state["total"] and len(items) >= state["total"]:
                     break
                 before = len(items)
+                try:
+                    page.evaluate(
+                        "window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
                 page.mouse.wheel(0, 2000)
-                page.wait_for_timeout(1800)
+                page.wait_for_timeout(1500)
                 idle = 0 if len(items) > before else idle + 1
         finally:
             page.remove_listener("response", on_response)
@@ -515,6 +544,16 @@ def collect_mix(video_id: str):
         if total and len(items) < total:
             print(f"  ⚠ 剧集只拿到 {len(items)}/{total} 集（翻页未完成）",
                   flush=True)
+        elif not total:
+            # 总集数未知时用标题里的最大集号推断，尽量发现截断
+            expected = 0
+            for it in items:
+                expected = max(expected, it.get("ep") or 0,
+                               series_detect.episode_hint(
+                                   it.get("title") or ""))
+            if expected > len(items):
+                print(f"  ⚠ 剧集疑似不全：拿到 {len(items)} 集，"
+                      f"但标题集数已达第 {expected} 集", flush=True)
         items = sort_episodes(items)
         return items
 
@@ -727,6 +766,22 @@ def test_parse_mix_response():
     assert {(g["aweme_id"], g["ep"]) for g in got} == \
         {("111", 2), ("222", 1), ("333", 0)}
     assert parse_mix_response(payload, seen) == []
+
+
+def test_looks_continuous():
+    eps_ep = [{"title": "《寻龙》第1集"}, {"title": "《寻龙》第2集"},
+              {"title": "《寻龙》第3集"}]
+    ok, why = looks_continuous(eps_ep)
+    assert ok and "集数标记" in why
+    eps_pre = [{"title": "盛夏光年故事之上"}, {"title": "盛夏光年故事之下"},
+               {"title": "盛夏光年故事番外"}]
+    ok2, why2 = looks_continuous(eps_pre)
+    assert ok2 is True and "前缀" in why2
+    eps_bad = [{"title": "今天吃火锅"}, {"title": "昨天去钓鱼"},
+               {"title": "日常vlog记录"}]
+    ok3, why3 = looks_continuous(eps_bad)
+    assert ok3 is False and "混杂" in why3
+    assert looks_continuous([{"title": "唯一"}])[0] is False
 
 
 def test_sort_episodes_and_prefix():
