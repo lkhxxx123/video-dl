@@ -12,6 +12,7 @@
 仅限个人离线保存；请尊重创作者版权，勿二次上传。
 """
 import argparse
+import json
 import os
 import random
 import re
@@ -260,6 +261,14 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         base_url, model, out_dir: Path, sample=2):
     state = douyin_auto.load_state(out_dir)
     douyin_auto.reconcile_state(out_dir, state)
+    # 项目级弃剧名单(跨天): 有水印弃用的合集直接跳过, 不再重复采样
+    skip_path = ds.SCRIPT_DIR / "watermark_skip.json"
+    skip_list = {}
+    if skip_path.exists():
+        try:
+            skip_list = json.loads(skip_path.read_text(encoding="utf-8"))
+        except Exception:
+            skip_list = {}
     done_ids = (set(state["processed"])
                 | ds.existing_ids_under(ds.DOWNLOADS_DIR))
     print(f"起点: 已处理 {len(done_ids)} 条")
@@ -285,6 +294,26 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             print(f"作者: {it.get('nick') or '?'}  "
                   f"主页: https://www.douyin.com/user/{it['sec_uid']}")
         print(f"入口视频: {it['aweme_id']}")
+        mid_str = str(it.get("mix_id") or "")
+        if mid_str in skip_list:
+            rec = skip_list[mid_str]
+            print(f"  ↳ 已弃剧记录（{rec.get('date', '?')} "
+                  f"{rec.get('reason', '')}），直接跳过")
+            stat["skip_done"] += 1
+            continue
+
+        def record_abandon(reason):
+            if mid_str:
+                skip_list[mid_str] = {"name": name[:40],
+                                      "reason": reason,
+                                      "date": time.strftime("%Y-%m-%d")}
+                try:
+                    skip_path.write_text(
+                        json.dumps(skip_list, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+                except Exception:
+                    pass
+
         sdir = out_dir / "剧集" / ds.safe_dir_name(name)
         q = sdir / "疑似水印"
 
@@ -372,6 +401,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 print(f"  ⚑ 前{len(judged)}集采样即有水印"
                       f"（{sum(1 for v in judged if v == 'watermarked')}"
                       f"/{len(judged)}）→ 弃剧（后续逻辑全跳过）", flush=True)
+                record_abandon("前几集采样即有水印")
                 n_new += 1
                 print("  ⚑ 本部完成（采样弃剧）")
                 continue
@@ -437,6 +467,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             if any(v == "watermarked" for v in head_eff):
                 print("  ⚑ 前几集采样即有水印 → 弃剧（后续逻辑全跳过）",
                       flush=True)
+                record_abandon("前几集采样即有水印")
                 n_new += 1
                 print("  ⚑ 本部完成（采样弃剧）")
                 continue
@@ -448,6 +479,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     and all(v == "watermarked" for v in tail_eff)):
                 print(f"  ⚑ 尾部{len(tail_eff)}集均有水印"
                       f"（作者中途加印）→ 弃剧", flush=True)
+                record_abandon("尾部集均有水印(作者中途加印)")
                 n_new += 1
                 print("  ⚑ 本部完成（尾部弃剧）")
                 continue
