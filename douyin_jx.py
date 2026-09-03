@@ -411,8 +411,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                       f"（{sum(1 for v in judged if v == 'watermarked')}"
                       f"/{len(judged)}）→ 弃剧（后续逻辑全跳过）", flush=True)
                 record_abandon("前几集采样即有水印")
-                n_new += 1
-                print("  ⚑ 本部完成（采样弃剧）")
+                stat["abandoned"] = stat.get("abandoned", 0) + 1
+                print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
                 continue
             print("  (采样通过 → 冲刺翻页拉取全剧集目录（只取列表不下载）…)",
                   flush=True)
@@ -476,8 +476,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 print(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
                       flush=True)
                 record_abandon(f"采样{wm_n}/{len(eff)}集有水印")
-                n_new += 1
-                print("  ⚑ 本部完成（采样弃剧）")
+                stat["abandoned"] = stat.get("abandoned", 0) + 1
+                print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
                 continue
             # 全净才免判中间；且要求至少 2*sample-1 集有效判定
             # （防识图失败被当成通过）
@@ -497,7 +497,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         n_new += 1
         print("  ⚑ 本部完成")
     print(f"\n==== 结束 ====")
-    print(f"新处理 {n_new} 部 / 已完整跳过 {stat['skip_done']} 部"
+    print(f"成功保留 {n_new} 部 / 弃用 {stat.get('abandoned', 0)} 部"
+          f" / 已完整跳过 {stat['skip_done']} 部"
           f"｜分集: 干净 {stat['clean']} / 水印移走 {stat['wm']}"
           f" / 未判定 {stat['nojudge']}")
 
@@ -507,7 +508,8 @@ def main(argv=None):
         description="精选合集：搜索→作者合集页→具体合集滑动拉全→逐集下载验水印")
     parser.add_argument("keyword", nargs="?", help="关键词，中英文逗号分隔")
     parser.add_argument("--limit", type=int, default=10,
-                        help="下载剧的部数（默认 10，按部计数）")
+                        help="成功保留的剧数（默认 10；弃用剧/已完整剧"
+                             " 不计入）")
     parser.add_argument("--max-followers", type=int, default=None)
     parser.add_argument("--max-duration", type=int, default=None)
     parser.add_argument("--max-likes", type=int, default=None)
