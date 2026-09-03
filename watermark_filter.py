@@ -111,25 +111,71 @@ PROMPT = """你是视频水印审核员。下面是同一个视频按时间顺�
 {{"has_author_watermark": true或false, "type": "account或ai_label或title或空", "moving": true或false, "desc": "简述依据", "frames_with_watermark": [帧序号,从1开始]}}"""
 
 
+def _anthropic_messages_url(base_url: str) -> str:
+    """Anthropic 端点归一：/anthropic 或 .../v1/messages → 完整 messages URL。"""
+    url = base_url.rstrip("/")
+    if url.endswith("/v1/messages"):
+        return url
+    if url.endswith("/v1"):
+        return url + "/messages"
+    return url + "/v1/messages"
+
+
+def _anthropic_text(data: dict) -> str:
+    """从 Anthropic Messages 响应的 content blocks 拼出文本。"""
+    return "".join(b.get("text", "") for b in data.get("content", [])
+                   if isinstance(b, dict))
+
+
 def ask_vlm(frames, api_key: str, base_url: str, model: str) -> dict:
-    """多帧一次调用，返回判定 dict；解析失败/HTTP 失败重试。"""
-    content = []
-    for f in frames:
-        b64 = base64.b64encode(f.read_bytes()).decode()
-        content.append({"type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    content.append({"type": "text", "text": PROMPT.format(N=len(frames))})
-    body = {"model": model,
-            "messages": [{"role": "user", "content": content}]}
+    """多帧一次调用，返回判定 dict；解析失败/HTTP 失败重试。
+
+    自动分协议：base_url 含 /anthropic → Anthropic Messages 格式
+    （MiniMax M3 等走此协议）；否则 OpenAI chat/completions 格式。
+    """
+    is_anthropic = "/anthropic" in base_url
+    if is_anthropic:
+        content = []
+        for f in frames:
+            b64 = base64.b64encode(f.read_bytes()).decode()
+            content.append({"type": "image",
+                            "source": {"type": "base64",
+                                       "media_type": "image/jpeg",
+                                       "data": b64}})
+        content.append({"type": "text",
+                        "text": PROMPT.format(N=len(frames))})
+        body = {"model": model, "max_tokens": 1024,
+                "messages": [{"role": "user", "content": content}]}
+        url = _anthropic_messages_url(base_url)
+        headers = {"x-api-key": api_key,
+                   "Authorization": f"Bearer {api_key}",
+                   "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+
+        def extract(r):
+            return _anthropic_text(r.json())
+    else:
+        content = []
+        for f in frames:
+            b64 = base64.b64encode(f.read_bytes()).decode()
+            content.append({"type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64}"}})
+        content.append({"type": "text", "text": PROMPT.format(N=len(frames))})
+        body = {"model": model,
+                "messages": [{"role": "user", "content": content}]}
+        url = base_url.rstrip("/")
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        def extract(r):
+            return r.json()["choices"][0]["message"]["content"]
+
     last_exc = None
     for attempt in range(RETRIES + 1):
         try:
-            r = requests.post(
-                f"{base_url.rstrip('/')}",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=body, timeout=120)
+            r = requests.post(url, headers=headers, json=body, timeout=120)
             r.raise_for_status()
-            return parse_verdict(r.json()["choices"][0]["message"]["content"])
+            return parse_verdict(extract(r))
         except Exception as e:  # noqa: BLE001 - 统一重试
             last_exc = e
             if attempt < RETRIES:
@@ -246,6 +292,22 @@ def test_parse_verdict_wrapped_and_invalid():
             assert False, f"应拒绝: {bad}"
         except ValueError:
             pass
+
+
+def test_anthropic_url_and_text():
+    assert _anthropic_messages_url(
+        "https://api.minimaxi.com/anthropic") == \
+        "https://api.minimaxi.com/anthropic/v1/messages"
+    assert _anthropic_messages_url(
+        "https://api.minimaxi.com/anthropic/v1") == \
+        "https://api.minimaxi.com/anthropic/v1/messages"
+    assert _anthropic_messages_url(
+        "https://api.minimaxi.com/anthropic/v1/messages/") == \
+        "https://api.minimaxi.com/anthropic/v1/messages"
+    assert _anthropic_text({"content": [
+        {"type": "thinking", "thinking": "…"},
+        {"type": "text", "text": "结果"},
+    ]}) == "结果"
 
 
 def test_unique_dest():
