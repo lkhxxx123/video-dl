@@ -353,7 +353,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 n_new += 1
                 print("  ⚑ 本部完成（采样弃剧）")
                 continue
-            print("  (采样通过 → 拉取全集…)", flush=True)
+            print("  (采样通过 → 拉取全剧集目录（只取列表不下载）…)",
+                  flush=True)
             try:
                 eps, complete = collect_collection(
                     it["aweme_id"], it.get("sec_uid") or "",
@@ -383,10 +384,16 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             stat["skip_done"] += 1
             continue
         print(f"  共 {len(eps)} 集 → {sdir}")
-        # 采样提速③：首2+尾2集判定，均无水印 → 中间集只下载不判定
-        # （首集抓"从头有水印"，尾集抓"中途才加水印"——作者涨粉后加印常见）
+        # 采样提速③：首2集已判过 → 此处直接下载最后2集判定；
+        # 均无水印 → 中间集只下载不判定（首集抓"从头有水印"，
+        # 尾集抓"中途才加水印"——作者涨粉后加印常见）
         skip_judge = False
         if (sample or 0) >= 2 and len(eps) > 2 * sample:
+            tail_pending = [ep for ep in eps[-sample:]
+                            if ep["aweme_id"] not in done_ids]
+            if tail_pending:
+                print(f"  → 直接下载最后 {len(tail_pending)} 集采样判定…",
+                      flush=True)
             positions = (list(enumerate(eps[:sample], 1))
                          + list(enumerate(eps[-sample:],
                                           len(eps) - sample + 1)))
