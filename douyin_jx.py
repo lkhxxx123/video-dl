@@ -253,7 +253,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         print("!! 没有带合集标记的候选（可放宽点赞阈值或换关键词）")
         return
 
-    stat = {"clean": 0, "wm": 0, "skip_done": 0}
+    stat = {"clean": 0, "wm": 0, "skip_done": 0, "nojudge": 0}
     n_new = 0
     for i, it in enumerate(series_all, 1):
         if n_new >= limit:
@@ -309,6 +309,26 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             time.sleep(random.uniform(1, 2))
             return "watermarked" if v.get("has_author_watermark") else "clean"
 
+        def download_only(ep, j):
+            """首尾采样通过后：只下载不判定（省识图调用）。"""
+            evid = ep["aweme_id"]
+            done_ids.add(evid)
+            prefix = ds.episode_prefix(ep.get("ep") or j, len(eps))
+            try:
+                douyin_dl.run(f"https://www.douyin.com/video/{evid}",
+                              sdir, name_prefix=prefix)
+            except Exception as e:  # noqa: BLE001
+                print(f"  {prefix}下载失败（重跑续传）: {e}")
+                time.sleep(2)
+                return
+            state["processed"][evid] = {
+                "verdict": "nojudge",
+                "desc": "首尾采样均无水印，跳过判定"}
+            douyin_auto.save_state(out_dir, state)
+            print(f"  ↓ {prefix}已下载（未判定）")
+            stat["nojudge"] += 1
+            time.sleep(random.uniform(1, 2))
+
         # 采样提速①：集合一够采样量就提前返回，先下前几集验水印；
         # 全有水印 → 弃剧（全集没滑完、其余没下载，最快路径）
         early = sample if (sample or 0) >= 2 else 0
@@ -363,15 +383,42 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             stat["skip_done"] += 1
             continue
         print(f"  共 {len(eps)} 集 → {sdir}")
+        # 采样提速③：首2+尾2集判定，均无水印 → 中间集只下载不判定
+        # （首集抓"从头有水印"，尾集抓"中途才加水印"——作者涨粉后加印常见）
+        skip_judge = False
+        if (sample or 0) >= 2 and len(eps) > 2 * sample:
+            positions = (list(enumerate(eps[:sample], 1))
+                         + list(enumerate(eps[-sample:],
+                                          len(eps) - sample + 1)))
+            verdicts = []
+            for j, ep in positions:
+                evid = ep["aweme_id"]
+                if evid in done_ids:
+                    verdicts.append(
+                        state["processed"].get(evid, {}).get("verdict")
+                        or "unknown")
+                    continue
+                verdicts.append(fetch_and_judge(ep, j, len(eps)))
+            eff = [v for v in verdicts
+                   if v in ("clean", "watermarked")]
+            if eff and all(v == "clean" for v in eff):
+                skip_judge = True
+                mid = len(eps) - 2 * sample
+                print(f"  ⚑ 首尾{len(eff)}集均无水印 → 中间 {mid} 集"
+                      f"只下载不判定", flush=True)
         for j, ep in enumerate(eps, 1):
             if ep["aweme_id"] in done_ids:
                 continue
-            fetch_and_judge(ep, j, len(eps))
+            if skip_judge:
+                download_only(ep, j)
+            else:
+                fetch_and_judge(ep, j, len(eps))
         n_new += 1
         print("  ⚑ 本部完成")
     print(f"\n==== 结束 ====")
     print(f"新处理 {n_new} 部 / 已完整跳过 {stat['skip_done']} 部"
-          f"｜分集: 干净 {stat['clean']} / 水印移走 {stat['wm']}")
+          f"｜分集: 干净 {stat['clean']} / 水印移走 {stat['wm']}"
+          f" / 未判定 {stat['nojudge']}")
 
 
 def main(argv=None):
