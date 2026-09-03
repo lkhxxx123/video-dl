@@ -229,7 +229,7 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name=""):
 # ---------- 编排 ----------
 
 def run(keywords, limit, filters, block_keywords, frames_n, api_key,
-        base_url, model, out_dir: Path):
+        base_url, model, out_dir: Path, sample=2):
     state = douyin_auto.load_state(out_dir)
     douyin_auto.reconcile_state(out_dir, state)
     done_ids = (set(state["processed"])
@@ -289,10 +289,10 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         sdir = out_dir / "剧集" / ds.safe_dir_name(name)
         q = sdir / "疑似水印"
         print(f"  共 {len(eps)} 集 → {sdir}")
-        for j, ep in enumerate(eps, 1):
+
+        def fetch_and_judge(ep, j):
+            """下载并判定单集。返回 clean/watermarked/skip/error。"""
             evid = ep["aweme_id"]
-            if evid in done_ids:
-                continue
             done_ids.add(evid)
             prefix = ds.episode_prefix(ep.get("ep") or j, len(eps))
             try:
@@ -302,25 +302,26 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 state["processed"][evid] = {"verdict": "skip",
                                             "desc": str(e)}
                 douyin_auto.save_state(out_dir, state)
-                continue
+                return "skip"
             except Exception as e:  # noqa: BLE001 - 单集失败不中断
                 print(f"  {prefix}下载失败（重跑续传）: {e}")
                 time.sleep(2)
-                continue
+                return "error"
             f = douyin_auto.find_by_id(sdir, evid)
             if not f:
-                continue
+                return "error"
             try:
                 v = douyin_auto.judge_file(f, api_key, base_url, model,
                                            frames_n, sdir / ".wm_frames")
             except Exception as e:  # noqa: BLE001 - 识图失败保留重判
                 print(f"  {prefix}识图失败（保留，重跑重判）: {e}")
-                continue
+                return "error"
             if v.get("has_author_watermark"):
                 q.mkdir(exist_ok=True)
                 shutil.move(str(f), str(wf.unique_dest(q / f.name)))
                 state["processed"][evid] = {
-                    "verdict": "watermarked", "desc": v.get("desc", "")[:60]}
+                    "verdict": "watermarked",
+                    "desc": v.get("desc", "")[:60]}
                 print(f"  ⚠ {prefix}有作者水印 → 移走")
                 stat["wm"] += 1
             else:
@@ -329,6 +330,31 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 stat["clean"] += 1
             douyin_auto.save_state(out_dir, state)
             time.sleep(random.uniform(1, 2))
+            return "watermarked" if v.get("has_author_watermark") else "clean"
+
+        # 采样提速：先下前 sample 集验水印，全部有水印 → 整部跳过
+        # （作者水印高度一致；1/N 不一致时不可信采样，回退逐集）
+        todo = list(enumerate(eps, 1))
+        if sample >= 2 and len(eps) > sample:
+            head = todo[:sample]
+            rest = todo[sample:]
+            verdicts = []
+            for j, ep in head:
+                if ep["aweme_id"] in done_ids:
+                    continue
+                verdicts.append(fetch_and_judge(ep, j))
+            wm_hits = sum(1 for v in verdicts if v == "watermarked")
+            if verdicts and wm_hits == len(verdicts):
+                print(f"  ⚑ 采样 {len(verdicts)} 集均有水印 → 跳过整部"
+                      f"（省 {len(rest)} 次下载/判定）", flush=True)
+                n_new += 1
+                print("  ⚑ 本部完成（采样跳过）")
+                continue
+            todo = head + rest  # 部分判定过的集继续由下方循环跳过(done)
+        for j, ep in todo:
+            if ep["aweme_id"] in done_ids:
+                continue
+            fetch_and_judge(ep, j)
         n_new += 1
         print("  ⚑ 本部完成")
     print(f"\n==== 结束 ====")
@@ -348,6 +374,9 @@ def main(argv=None):
     parser.add_argument("--block-keywords", default=None,
                         help="作者黑名单关键词; 默认内置搬运/侵权词表, 空串禁用")
     parser.add_argument("--frames", type=int, default=6)
+    parser.add_argument("--sample", type=int, default=2,
+                        help="采样提速: 先下前N集验水印, 全有水印则跳过整部"
+                             " (默认2, 0=关闭逐集判定)")
     parser.add_argument("--model", default=wf.DEFAULT_MODEL)
     parser.add_argument("--base-url", default=wf.DEFAULT_BASE_URL)
     parser.add_argument("--selftest", action="store_true",
@@ -375,7 +404,7 @@ def main(argv=None):
         block_kw = ds.split_keywords(args.block_keywords)
     try:
         run(keywords, args.limit, filters, block_kw, args.frames, api_key,
-            args.base_url, args.model, out_dir)
+            args.base_url, args.model, out_dir, sample=args.sample)
     except KeyboardInterrupt:
         print("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)
