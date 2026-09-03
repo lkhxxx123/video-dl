@@ -430,6 +430,17 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 verdicts.append(fetch_and_judge(ep, j, len(eps)))
             eff = [v for v in verdicts
                    if v in ("clean", "watermarked")]
+            # 尾部2集均有水印 = 作者中途加印（前净后脏），中后期基本全有
+            # → 弃剧（前2集已下载的干净集保留），省掉整部下载+判定
+            tail_eff = [v for v in verdicts[sample:]
+                        if v in ("clean", "watermarked")]
+            if (len(tail_eff) >= 2
+                    and all(v == "watermarked" for v in tail_eff)):
+                print(f"  ⚑ 尾部{len(tail_eff)}集均有水印"
+                      f"（作者中途加印）→ 弃剧", flush=True)
+                n_new += 1
+                print("  ⚑ 本部完成（尾部弃剧）")
+                continue
             if eff and all(v == "clean" for v in eff):
                 skip_judge = True
                 mid = len(eps) - 2 * sample
