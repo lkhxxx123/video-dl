@@ -121,7 +121,7 @@ def test_click_card_js_contents():
 # ---------- 核心：按用户流程收集合集全部剧集 ----------
 
 def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
-                       early_stop=0):
+                       early_stop=0, fast=False):
     """作者主页 → 合集页 → 点进具体合集 → 滑动拉全部分集。
 
     返回按集数/发布时间升序的 [{aweme_id, title, ep, ct}]（从第 1 集开始）。
@@ -191,7 +191,12 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
                     print(f"  (该合集共 {state['total']} 集)", flush=True)
             else:
                 print("  (未找到合集卡片，收集页面现有内容)", flush=True)
-            page.wait_for_timeout(3000)
+            # fast=True 冲刺翻页(只要尾部, 等待砍到1/3): 稳2500→800,
+            # 每轮1800→500, idle 20→10
+            settle_ms = 800 if fast else 2500
+            round_ms = 500 if fast else 1800
+            max_idle = 10 if fast else 20
+            page.wait_for_timeout(settle_ms)
             # 播放页形态时集数列表可能折叠，尝试展开
             try:
                 page.get_by_text("展开", exact=True).first.click(
@@ -207,7 +212,7 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
             # ③'' 持续滑动加载当前合集所有剧集
             stopped_early = False
             idle = 0
-            while idle < 20:
+            while idle < max_idle:
                 if state["total"] and len(items) >= state["total"]:
                     break
                 if early_stop >= 2 and len(items) >= early_stop:
@@ -221,7 +226,7 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
                 except Exception:
                     pass
                 page.mouse.wheel(0, 2000)
-                page.wait_for_timeout(1800)
+                page.wait_for_timeout(round_ms)
                 idle = 0 if len(items) > before else idle + 1
         finally:
             page.remove_listener("response", on_response)
@@ -353,12 +358,13 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 n_new += 1
                 print("  ⚑ 本部完成（采样弃剧）")
                 continue
-            print("  (采样通过 → 拉取全剧集目录（只取列表不下载）…)",
+            print("  (采样通过 → 冲刺翻页拉取全剧集目录（只取列表不下载）…)",
                   flush=True)
             try:
                 eps, complete = collect_collection(
                     it["aweme_id"], it.get("sec_uid") or "",
-                    mix_id=str(it.get("mix_id") or ""), mix_name=name)
+                    mix_id=str(it.get("mix_id") or ""), mix_name=name,
+                    fast=True)
             except ds.SearchError as e:
                 print(f"  !! 拉全集失败: {e}")
                 continue
