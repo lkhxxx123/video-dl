@@ -16,8 +16,8 @@ from pathlib import Path
 
 import requests
 
-DEFAULT_MODEL = "qwen3.8-flash"
-DEFAULT_BASE_URL = "https://llm-3vgdkksq524udbjm.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL = "MiniMax-M3"
+DEFAULT_BASE_URL = "https://api.minimaxi.com/anthropic"
 FRAME_WIDTH = 640
 RETRIES = 2
 

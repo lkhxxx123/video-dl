@@ -7,9 +7,9 @@
 - Python 3.10+（命令一律 `python`）
 - `pip install playwright && playwright install chromium`（搜索/剧集需要）
 - ffmpeg / ffprobe（水印检测抽帧，需在 PATH）
-- `key.txt`：**只放一行 Key 本体**（任何 OpenAI 兼容服务商；默认百炼
-  `qwen3.8-flash`，或 MiniMax `--model MiniMax-M3 --base-url
-  https://api.minimaxi.com/anthropic`，Key 与服务商配套换）
+- `key.txt`：**只放一行 Key 本体**（任何 OpenAI 兼容服务商）
+- 识图默认：MiniMax `MiniMax-M3`（Anthropic 协议端点，与订阅 Key 配套）；
+  换百炼时加 `--model qwen3.8-flash --base-url <百炼兼容端点>` 并换 key
 
 统一入口：`python run.py <模式>`，所有模式共用：滑块验证需人在场、
 风控自动切浏览器兜底、全局去重（文件名尾部视频 ID）、断点续跑。
