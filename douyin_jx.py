@@ -313,6 +313,15 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                         encoding="utf-8")
                 except Exception:
                     pass
+            # 目录改名标记弃用（不影响去重——去重靠文件名尾部ID）
+            try:
+                if (sdir.is_dir()
+                        and not sdir.name.endswith("-有水印弃用")):
+                    sdir.rename(
+                        sdir.with_name(sdir.name + "-有水印弃用"))
+                    print(f"  ↳ 目录已标记: {sdir.name}", flush=True)
+            except Exception:
+                pass
 
         sdir = out_dir / "剧集" / ds.safe_dir_name(name)
         q = sdir / "疑似水印"
