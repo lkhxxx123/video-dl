@@ -253,7 +253,7 @@ def download_mix(video_id: str, judge: bool, api_key: str = "",
 
 def run(keywords, target, filters, frames_n, api_key, base_url, model,
         out_dir: Path, block_keywords=None, max_episodes=100,
-        user_series=True):
+        user_series=True, series=True):
     quarantine = out_dir / "疑似水印"
     workdir = out_dir / ".wm_frames"
     state = load_state(out_dir)
@@ -381,7 +381,7 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
             if it.get("sec_uid"):
                 print(f"作者: {it.get('nick') or '?'}  "
                       f"主页: https://www.douyin.com/user/{it['sec_uid']}")
-            if it.get("mix_id"):
+            if it.get("mix_id") and series:
                 # 剧集：拉全部集（豁免筛选），每集计数；选定即整部拿全
                 print(f"  ⚑ 剧集: {(it.get('mix_name') or '?')[:24]}"
                       f" → 拉取全部集", flush=True)
@@ -417,7 +417,7 @@ def run(keywords, target, filters, frames_n, api_key, base_url, model,
                 process(vid, title)
                 progressed = True
                 continue
-            if (user_series and it.get("sec_uid")
+            if (user_series and series and it.get("sec_uid")
                     and series_detect.episode_hint(title)):
                 # 无合集字段但标题带集数标记 → 主页AI识别同系列
                 print("  ⚑ 标题含集数标记 → 作者主页AI识别系列", flush=True)
@@ -463,6 +463,8 @@ def main(argv=None):
                              " 默认内置搬运/侵权类词表, 传空串禁用")
     parser.add_argument("--max-episodes", type=int, default=100,
                         help="单部剧集最多下载集数（安全上限，默认 100）")
+    parser.add_argument("--no-series", action="store_true",
+                        help="散片模式: 跳过所有剧集候选(含官方合集), 只下散片")
     parser.add_argument("--no-user-series", action="store_true",
                         help="禁用作者主页AI识别剧集兜底（只用合集/系列接口）")
     parser.add_argument("--frames", type=int, default=6,
@@ -497,7 +499,8 @@ def main(argv=None):
         run(keywords, args.limit, filters, args.frames, api_key,
             args.base_url, args.model, out_dir, block_keywords=block_kw,
             max_episodes=args.max_episodes,
-            user_series=not args.no_user_series)
+            user_series=not (args.no_user_series or args.no_series),
+            series=not args.no_series)
     except KeyboardInterrupt:
         print("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)
