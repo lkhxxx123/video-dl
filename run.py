@@ -32,14 +32,20 @@ KEY_HINT = ("错误: 未找到 Key —— 用记事本打开 key.txt, 把百炼 
 
 
 def load_key() -> bool:
-    """key.txt 中有效 Key(sk-开头) → 注入环境变量。已有环境变量则直接用。"""
+    """key.txt 第一行有效 Key → 注入环境变量。已有环境变量则直接用。
+
+    key.txt 只放 key 本体（一行，不带备注）；不要求 sk- 开头——
+    不同 OpenAI 兼容服务商的 key 前缀不同。
+    识别规则：纯 ASCII、无空白、≥8 字符（天然排除中文备注/占位行）。
+    """
     if os.environ.get("DASHSCOPE_API_KEY"):
         return True
     kf = SCRIPT_DIR / "key.txt"
     if kf.exists():
         for line in kf.read_text(encoding="utf-8").splitlines():
             k = line.strip()
-            if k.startswith("sk-") and "在这里" not in k and len(k) > 20:
+            if (k and k.isascii() and " " not in k and "\t" not in k
+                    and "在这里" not in k and len(k) >= 8):
                 os.environ["DASHSCOPE_API_KEY"] = k
                 return True
     return False
