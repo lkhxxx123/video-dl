@@ -5,6 +5,7 @@
 用法:
   python run.py                          一条龙默认任务: 凑 50 条干净视频(需Key)
   python run.py auto [参数...]            一条龙, 其余参数透传 douyin_auto
+  python run.py clips "关键词" [参数...]   散片: root搜索→小时分桶→3帧验水印
   python run.py jx [参数...]              精选合集: 只下带合集标记的短剧(按部计数)
   python run.py search [参数...]          批量搜索下载(不验水印); 无参数=默认50条任务
   python run.py dl "口令或链接"           单条下载
@@ -127,6 +128,15 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"错误: {e}", file=sys.stderr)
             sys.exit(1)
+        return
+    if mode in ("clips", "sp"):
+        import douyin_clips
+        if not rest:
+            print("用法: python run.py clips \"关键词\" [参数…]",
+                  file=sys.stderr)
+            sys.exit(1)
+        need_key(rest)
+        douyin_clips.main(rest)
         return
     if mode in ("jx", "jingxuan"):
         import douyin_jx
