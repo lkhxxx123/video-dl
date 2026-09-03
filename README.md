@@ -65,21 +65,18 @@ python run.py clips "抖音ai创作大赛" --limit 20 --max-likes 50000
 
 ---
 
-## 其他模式（速查）
+## 依赖库（勿删，两个脚本共用）
 
-```cmd
-python run.py dl "口令/链接"                 :: 单条下载
-python run.py mix "剧集任意一集链接"          :: 手动拉整部剧集
-python run.py search "关键词" --limit 20     :: 批量搜索(不验水印)
-python run.py auto "关键词" --no-series      :: 一条龙; --no-series=散片模式
-python run.py wm "目录" --dry-run            :: 对已有目录验水印; --rejudge 平反
-```
+`douyin_dl.py`(下载引擎/风控兜底) `douyin_search.py`(浏览器/搜索/筛选)
+`douyin_auto.py`(状态/判定) `watermark_filter.py`(识图)
+`series_detect.py`(集数标记识别)
 
 ## 常见问题
 
-- **滑块/扫码**：搜索类模式弹出浏览器后需人在场完成；登录态存
-  `.browser-profile\`，过期重跑 `python run.py search --login`
+- **滑块/扫码**：首次运行会弹浏览器自动引导扫码登录（登录态存
+  `.browser-profile\`，一般 1~2 周有效，过期后下次运行自动再弹）；
+  搜索过程中的滑块需人在场完成
 - **换识图服务商**：`--model` + `--base-url` 成套换（base-url 含
-  `/anthropic` 自动走 Anthropic 协议，如 MiniMax M3）
+  `/anthropic` 自动走 Anthropic 协议，如 MiniMax M3），key.txt 同步换
 - **删除目录后重跑**：状态自动清理，可重新下载
 - **断点续跑**：任何模式中断后重跑同命令自动续
