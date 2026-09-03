@@ -46,7 +46,7 @@ python run.py jx "AI 短剧" --limit 5 --max-likes 50000 --block-keywords "搬�
 非剧集短视频，独立流程：root 搜索 → 按小时分桶 → 每条 3 帧验水印。
 
 ```cmd
-python run.py clips "抖音ai创作大赛" --limit 20 --max-likes 50000
+python run.py clips "抖音ai创作大赛" --limit 10 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |

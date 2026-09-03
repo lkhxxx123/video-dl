@@ -11,6 +11,7 @@
 仅限个人离线保存；请尊重创作者版权，勿二次上传。
 """
 import argparse
+import json
 import os
 import random
 import re
@@ -79,6 +80,38 @@ def test_hour_bucket_name():
     assert re.fullmatch(r"\d{2}点", hour_bucket_name())
     assert hour_bucket_name(time.mktime((2026, 9, 3, 9, 5, 0, 0, 0, -1))) \
         == "09点"
+
+
+
+# ---------- 散片独立状态（与合集 auto_state.json 互不串账） ----------
+
+def load_state(out_dir: Path) -> dict:
+    p = out_dir / "clips_state.json"
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data.get("processed"), dict):
+                return data
+        except Exception:
+            pass
+    return {"processed": {}}
+
+
+def save_state(out_dir: Path, state: dict) -> None:
+    (out_dir / "clips_state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def reconcile_state(out_dir: Path, state: dict) -> None:
+    alive = ds.existing_ids_under(ds.DOWNLOADS_DIR)
+    drop = [vid for vid, v in state["processed"].items()
+            if v.get("verdict") in ("clean", "watermarked")
+            and vid not in alive]
+    for vid in drop:
+        del state["processed"][vid]
+    if drop:
+        save_state(out_dir, state)
+        print(f"[状态清理] {len(drop)} 条记录的文件已不存在，已重置")
 
 
 # ---------- 收集（独立实现，不动合集脚本） ----------
@@ -167,8 +200,8 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
 
 def run(keywords, limit, filters, block_keywords, api_key, base_url,
         model, out_dir: Path):
-    state = douyin_auto.load_state(out_dir)
-    douyin_auto.reconcile_state(out_dir, state)
+    state = load_state(out_dir)
+    reconcile_state(out_dir, state)
     done_ids = (set(state["processed"])
                 | ds.existing_ids_under(ds.DOWNLOADS_DIR))
     print(f"起点: 已处理 {len(done_ids)} 条")
@@ -202,7 +235,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
             except douyin_dl.ParseError as e:
                 state["processed"][vid] = {"verdict": "skip",
                                            "desc": str(e)}
-                douyin_auto.save_state(out_dir, state)
+                save_state(out_dir, state)
                 progressed = True
                 continue
             except Exception as e:  # noqa: BLE001 - 失败可重试
@@ -231,7 +264,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
                 clean += 1
                 print("  ✓ 干净，计入")
                 stat["clean"] += 1
-            douyin_auto.save_state(out_dir, state)
+            save_state(out_dir, state)
             progressed = True
             time.sleep(random.uniform(1, 2))
         if not progressed:
