@@ -21,7 +21,7 @@
 按用户手动流程：精选搜索 → 作者主页合集页 → 点进具体合集滑动拉全 → 逐集下载。
 
 ```cmd
-python run.py jx "AI 短剧" --limit 5 --max-likes 50000 --block-keywords "搬运,侵权" --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py jx "AI 短剧" --limit 5 --max-duration 600 --max-likes 50000 --block-keywords "搬运,侵权" --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |
@@ -32,6 +32,7 @@ python run.py jx "AI 短剧" --limit 5 --max-likes 50000 --block-keywords "搬�
 | `--block-keywords` | 内置词表 | 搬运/侵权号黑名单（简介/昵称/标题） |
 | `--frames N` | 6 | 每条抽帧数 |
 | `--sample N` | 2 | 采样提速：前 N + 后 N 集，`0` 关闭 |
+| `--max-ep-duration S` | 600 | **合并总集拦截**：单集超 S 秒的占比 ≥60% 判弃（"一口气/1-N集合集"类）；`0` 关闭。与入口筛选 `--max-duration` 独立 |
 
 **行为要点**：
 - 采样 4 集（前2+后2）任一有水印 → **弃剧**（识图 ≤4 次）
@@ -46,7 +47,7 @@ python run.py jx "AI 短剧" --limit 5 --max-likes 50000 --block-keywords "搬�
 非剧集短视频，独立流程：root 搜索 → 按小时分桶 → 每条 3 帧验水印。
 
 ```cmd
-python run.py clips "抖音ai创作大赛" --limit 10 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py clips "抖音ai创作大赛" --limit 10 --max-duration 600 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |

@@ -113,6 +113,18 @@ _SCROLL_ALL_JS = r"""() => {
 }"""
 
 
+def is_compilation(eps, max_sec):
+    """合并总集类合集判定：超时长(>max_sec)集占比 ≥60% → (True, 超长数, 总数)。
+
+    dur 缺失按不超长计（series 接口部分条目无时长字段）。
+    """
+    if len(eps) < 2 or not max_sec:
+        return False, 0, len(eps)
+    limit_ms = max_sec * 1000
+    n_long = sum(1 for e in eps if (e.get("dur") or 0) > limit_ms)
+    return n_long * 10 >= len(eps) * 6, n_long, len(eps)
+
+
 # ---------- 测试 ----------
 
 def test_pick_series_dedup_and_limit():
@@ -126,6 +138,20 @@ def test_pick_series_dedup_and_limit():
     assert total == 2 and [g["mix_name"] for g in got] == ["剧A", "剧B"]
     got2, _ = pick_series(pool, 10)
     assert len(got2) == 2 and len({g["mix_id"] for g in got2}) == 2
+
+
+def test_is_compilation():
+    # 10 集中 7 集超 10 分钟 → 合并总集
+    eps = [{"dur": 700000}] * 7 + [{"dur": 200000}] * 3
+    flag, n, m = is_compilation(eps, 600)
+    assert flag is True and (n, m) == (7, 10)
+    # 10 集中 4 集超 → 正常长剧
+    eps2 = [{"dur": 700000}] * 4 + [{"dur": 200000}] * 6
+    assert is_compilation(eps2, 600)[0] is False
+    # 时长缺失不误伤（series 形态）
+    eps3 = [{"dur": 0}] * 10
+    assert is_compilation(eps3, 600)[0] is False
+    assert is_compilation(eps3, None)[0] is False
 
 
 def test_click_card_js_contents():
@@ -258,7 +284,7 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
 # ---------- 编排 ----------
 
 def run(keywords, limit, filters, block_keywords, frames_n, api_key,
-        base_url, model, out_dir: Path, sample=2):
+        base_url, model, out_dir: Path, sample=2, max_ep_duration=600):
     state = douyin_auto.load_state(out_dir)
     douyin_auto.reconcile_state(out_dir, state)
     # 项目级弃剧名单(跨天): 有水印弃用的合集直接跳过, 不再重复采样
@@ -448,6 +474,15 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 eps2 = []
             if len(eps2) > len(eps):
                 eps = eps2
+        # 合并总集拦截（全集列表到手后、采样下载前——最快拦截点）
+        comp, n_long, m = is_compilation(eps, max_ep_duration)
+        if comp:
+            print(f"  ⚑ 合并总集类合集（{n_long}/{m} 集超 "
+                  f"{max_ep_duration // 60} 分钟）→ 弃剧", flush=True)
+            record_abandon(f"合并总集({n_long}/{m}集超{max_ep_duration}s)")
+            stat["abandoned"] = stat.get("abandoned", 0) + 1
+            print("  ⚑ 本部完成（合并总集弃剧，不占配额）")
+            continue
         if len(eps) < 2:
             print("  ↳ 只拿到 1 集（非完整剧集），跳过")
             continue
@@ -537,6 +572,9 @@ def main(argv=None):
     parser.add_argument("--block-keywords", default=None,
                         help="作者黑名单关键词; 默认内置搬运/侵权词表, 空串禁用")
     parser.add_argument("--frames", type=int, default=6)
+    parser.add_argument("--max-ep-duration", type=int, default=600,
+                        help="单集时长上限秒(合并总集拦截: 超时长集占比"
+                             "达六成判弃; 0=关闭, 默认600)")
     parser.add_argument("--sample", type=int, default=2,
                         help="采样提速: 先下前N集验水印, 全有水印则跳过整部"
                              " (默认2, 0=关闭逐集判定)")
@@ -567,7 +605,8 @@ def main(argv=None):
         block_kw = ds.split_keywords(args.block_keywords)
     try:
         run(keywords, args.limit, filters, block_kw, args.frames, api_key,
-            args.base_url, args.model, out_dir, sample=args.sample)
+            args.base_url, args.model, out_dir, sample=args.sample,
+            max_ep_duration=args.max_ep_duration or None)
     except KeyboardInterrupt:
         print("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)

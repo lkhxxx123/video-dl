@@ -112,7 +112,11 @@ def author_blocked(item: dict, keywords):
 
 
 def parse_mix_response(payload: dict, seen: set):
-    """mix/series 接口响应 → 新增集条目 [{aweme_id,title,ep,ct}]。"""
+    """mix/series 接口响应 → 新增集条目 [{aweme_id,title,ep,ct,dur}]。
+
+    dur: 单集时长毫秒（video.duration，顶层 duration 兜底）——
+    用于合并总集类合集的判定（jx --max-ep-duration）。
+    """
     out = []
     for e in payload.get("aweme_list") or []:
         aid = e.get("aweme_id")
@@ -120,9 +124,11 @@ def parse_mix_response(payload: dict, seen: set):
             continue
         seen.add(aid)
         mix = e.get("mix_info") or {}
+        dur = (e.get("video") or {}).get("duration") or e.get("duration") or 0
         out.append({"aweme_id": aid, "title": e.get("desc") or "",
                     "ep": mix.get("current_episode") or 0,
-                    "ct": e.get("create_time") or 0})
+                    "ct": e.get("create_time") or 0,
+                    "dur": dur})
     return out
 
 
