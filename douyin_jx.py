@@ -83,16 +83,32 @@ _CLICK_CARD_JS = r"""(name) => {
     return null;
 }"""
 
-# 滚动：窗口到底 + 所有内部可滚动容器到底
+# 滚动：窗口到底 + 所有内部可滚动容器(含 shadow DOM)增量滚动并派发事件
+# （懒加载列表常只监听渐进 scroll 事件，一步跳底可能不触发翻页）
 _SCROLL_ALL_JS = r"""() => {
+    const walk = (root, out) => {
+        root.querySelectorAll('*').forEach(el => {
+            out.push(el);
+            if (el.shadowRoot) walk(el.shadowRoot, out);
+        });
+    };
+    const all = [];
+    walk(document, all);
     window.scrollTo(0, document.body.scrollHeight);
-    for (const el of document.querySelectorAll('*')) {
+    let n = 0;
+    for (const el of all) {
         const s = getComputedStyle(el);
         if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
             el.scrollHeight > el.clientHeight + 50) {
-            el.scrollTop = el.scrollHeight;
+            el.scrollTop += Math.max(200, el.clientHeight * 0.9);
+            if (el.scrollTop + el.clientHeight >= el.scrollHeight - 5) {
+                el.scrollTop = el.scrollHeight;
+            }
+            el.dispatchEvent(new Event('scroll', {bubbles: true}));
+            n++;
         }
     }
+    return n;
 }"""
 
 
