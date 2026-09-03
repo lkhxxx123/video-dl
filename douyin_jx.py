@@ -302,7 +302,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             stat["skip_done"] += 1
             continue
 
-        def record_abandon(reason):
+        def record_abandon(reason, count=None):
             if mid_str:
                 skip_list[mid_str] = {"name": name[:40],
                                       "reason": reason,
@@ -313,17 +313,29 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                         encoding="utf-8")
                 except Exception:
                     pass
-            # 目录改名标记弃用（不影响去重——去重靠文件名尾部ID）
+            # 目录改名: 前置弃用标记 + 集数（不影响去重——去重靠文件
+            # 名尾部ID）
             try:
-                if (sdir.is_dir()
-                        and not sdir.name.endswith("-有水印弃用")):
-                    sdir.rename(
-                        sdir.with_name(sdir.name + "-有水印弃用"))
-                    print(f"  ↳ 目录已标记: {sdir.name}", flush=True)
+                if sdir.is_dir() and not sdir.name.startswith(
+                        "有水印弃用-"):
+                    tag = "有水印弃用-" + ds.safe_dir_name(name)
+                    if count:
+                        tag += f"({count}集)"
+                    sdir.rename(sdir.with_name(tag))
+                    print(f"  ↳ 目录已标记: {tag}", flush=True)
             except Exception:
                 pass
 
-        sdir = out_dir / "剧集" / ds.safe_dir_name(name)
+        # 认领已有目录（含已改名 剧名(N集) 的），防止改名后目录分裂
+        base = ds.safe_dir_name(name)
+        sdir = out_dir / "剧集" / base
+        jdir = out_dir / "剧集"
+        if jdir.is_dir():
+            for d in sorted(jdir.iterdir()):
+                if (d.is_dir() and d.name.startswith(base)
+                        and not d.name.startswith("有水印弃用-")):
+                    sdir = d
+                    break
         q = sdir / "疑似水印"
 
         def fetch_and_judge(ep, j, total_eps):
@@ -475,7 +487,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 wm_n = sum(1 for v in eff if v == "watermarked")
                 print(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
                       flush=True)
-                record_abandon(f"采样{wm_n}/{len(eff)}集有水印")
+                record_abandon(f"采样{wm_n}/{len(eff)}集有水印",
+                               count=len(eps))
                 stat["abandoned"] = stat.get("abandoned", 0) + 1
                 print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
                 continue
@@ -494,6 +507,14 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 download_only(ep, j)
             else:
                 fetch_and_judge(ep, j, len(eps))
+        # 成功保留: 目录名加集数（幂等，已带括号则跳过）
+        try:
+            target = f"{base}({len(eps)}集)"
+            if sdir.is_dir() and sdir.name != target                     and not sdir.name.startswith("有水印弃用-"):
+                sdir.rename(sdir.with_name(target))
+                print(f"  ↳ 目录改名: {target}", flush=True)
+        except Exception:
+            pass
         n_new += 1
         print("  ⚑ 本部完成")
     print(f"\n==== 结束 ====")
