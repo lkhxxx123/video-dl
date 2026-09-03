@@ -367,10 +367,11 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                         for j, ep in enumerate(head, 1)]
             judged = [v for v in verdicts
                       if v in ("clean", "watermarked")]
-            if len(judged) >= 2 and all(v == "watermarked"
-                                        for v in judged):
-                print(f"  ⚑ 采样 {len(judged)} 集均有水印 → 弃剧"
-                      f"（全集未拉、其余未下）", flush=True)
+            # 前几集任一有水印 → 开头就挂印，后面逻辑全不走（用户规则）
+            if any(v == "watermarked" for v in judged):
+                print(f"  ⚑ 前{len(judged)}集采样即有水印"
+                      f"（{sum(1 for v in judged if v == 'watermarked')}"
+                      f"/{len(judged)}）→ 弃剧（后续逻辑全跳过）", flush=True)
                 n_new += 1
                 print("  ⚑ 本部完成（采样弃剧）")
                 continue
@@ -430,6 +431,15 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 verdicts.append(fetch_and_judge(ep, j, len(eps)))
             eff = [v for v in verdicts
                    if v in ("clean", "watermarked")]
+            # 前几集任一有水印 → 弃剧（后续逻辑全不走）
+            head_eff = [v for v in verdicts[:sample]
+                        if v in ("clean", "watermarked")]
+            if any(v == "watermarked" for v in head_eff):
+                print("  ⚑ 前几集采样即有水印 → 弃剧（后续逻辑全跳过）",
+                      flush=True)
+                n_new += 1
+                print("  ⚑ 本部完成（采样弃剧）")
+                continue
             # 尾部2集均有水印 = 作者中途加印（前净后脏），中后期基本全有
             # → 弃剧（前2集已下载的干净集保留），省掉整部下载+判定
             tail_eff = [v for v in verdicts[sample:]
