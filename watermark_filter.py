@@ -125,7 +125,7 @@ def ask_vlm(frames, api_key: str, base_url: str, model: str) -> dict:
     for attempt in range(RETRIES + 1):
         try:
             r = requests.post(
-                f"{base_url.rstrip('/')}/chat/completions",
+                f"{base_url.rstrip('/')}",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=body, timeout=120)
             r.raise_for_status()

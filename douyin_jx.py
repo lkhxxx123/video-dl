@@ -120,7 +120,8 @@ def test_click_card_js_contents():
 
 # ---------- 核心：按用户流程收集合集全部剧集 ----------
 
-def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name=""):
+def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
+                       early_stop=0):
     """作者主页 → 合集页 → 点进具体合集 → 滑动拉全部分集。
 
     返回按集数/发布时间升序的 [{aweme_id, title, ep, ct}]（从第 1 集开始）。
@@ -204,9 +205,15 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name=""):
             while time.time() < deadline and not items:
                 page.wait_for_timeout(1500)
             # ③'' 持续滑动加载当前合集所有剧集
+            stopped_early = False
             idle = 0
             while idle < 20:
                 if state["total"] and len(items) >= state["total"]:
+                    break
+                if early_stop >= 2 and len(items) >= early_stop:
+                    stopped_early = True
+                    print(f"  (已集齐采样所需 {len(items)} 集，提前返回)",
+                          flush=True)
                     break
                 before = len(items)
                 try:
@@ -223,7 +230,7 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name=""):
         if state["total"] and len(items) < state["total"]:
             print(f"  ⚠ 只拿到 {len(items)}/{state['total']} 集（滑动未翻完）",
                   flush=True)
-        return ds.sort_episodes(items)
+        return ds.sort_episodes(items), not stopped_early
 
 
 # ---------- 编排 ----------
@@ -257,44 +264,14 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             print(f"作者: {it.get('nick') or '?'}  "
                   f"主页: https://www.douyin.com/user/{it['sec_uid']}")
         print(f"入口视频: {it['aweme_id']}")
-        try:
-            eps = collect_collection(
-                it["aweme_id"], it.get("sec_uid") or "",
-                mix_id=str(it.get("mix_id") or ""),
-                mix_name=name)
-        except ds.SearchError as e:
-            print(f"  !! 拉合集失败: {e}")
-            continue
-        # 拉到的全已下载且数量偏少 → 疑似滑动不全，重拉一次
-        if (eps and len(eps) < 8
-                and all(ep["aweme_id"] in done_ids for ep in eps)):
-            print("  ↳ 疑似滑动不全，重拉一次…", flush=True)
-            try:
-                eps2 = collect_collection(
-                    it["aweme_id"], it.get("sec_uid") or "",
-                    mix_id=str(it.get("mix_id") or ""), mix_name=name)
-            except ds.SearchError:
-                eps2 = []
-            if len(eps2) > len(eps):
-                eps = eps2
-        if len(eps) < 2:
-            print("  ↳ 只拿到 1 集（非完整剧集），跳过")
-            continue
-        cont, why = ds.looks_continuous(eps)
-        print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
-        if all(ep["aweme_id"] in done_ids for ep in eps):
-            print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
-            stat["skip_done"] += 1
-            continue
         sdir = out_dir / "剧集" / ds.safe_dir_name(name)
         q = sdir / "疑似水印"
-        print(f"  共 {len(eps)} 集 → {sdir}")
 
-        def fetch_and_judge(ep, j):
+        def fetch_and_judge(ep, j, total_eps):
             """下载并判定单集。返回 clean/watermarked/skip/error。"""
             evid = ep["aweme_id"]
             done_ids.add(evid)
-            prefix = ds.episode_prefix(ep.get("ep") or j, len(eps))
+            prefix = ds.episode_prefix(ep.get("ep") or j, total_eps)
             try:
                 douyin_dl.run(f"https://www.douyin.com/video/{evid}",
                               sdir, name_prefix=prefix)
@@ -332,29 +309,64 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             time.sleep(random.uniform(1, 2))
             return "watermarked" if v.get("has_author_watermark") else "clean"
 
-        # 采样提速：先下前 sample 集验水印，全部有水印 → 整部跳过
-        # （作者水印高度一致；1/N 不一致时不可信采样，回退逐集）
-        todo = list(enumerate(eps, 1))
-        if sample >= 2 and len(eps) > sample:
-            head = todo[:sample]
-            rest = todo[sample:]
-            verdicts = []
-            for j, ep in head:
-                if ep["aweme_id"] in done_ids:
-                    continue
-                verdicts.append(fetch_and_judge(ep, j))
-            wm_hits = sum(1 for v in verdicts if v == "watermarked")
-            if verdicts and wm_hits == len(verdicts):
-                print(f"  ⚑ 采样 {len(verdicts)} 集均有水印 → 跳过整部"
-                      f"（省 {len(rest)} 次下载/判定）", flush=True)
+        # 采样提速①：集合一够采样量就提前返回，先下前几集验水印；
+        # 全有水印 → 弃剧（全集没滑完、其余没下载，最快路径）
+        early = sample if (sample or 0) >= 2 else 0
+        try:
+            eps, complete = collect_collection(
+                it["aweme_id"], it.get("sec_uid") or "",
+                mix_id=str(it.get("mix_id") or ""), mix_name=name,
+                early_stop=early)
+        except ds.SearchError as e:
+            print(f"  !! 拉合集失败: {e}")
+            continue
+        if not complete and len(eps) >= 2:
+            head = ds.sort_episodes(eps)[:sample]
+            verdicts = [fetch_and_judge(ep, j, max(len(eps), sample))
+                        for j, ep in enumerate(head, 1)]
+            judged = [v for v in verdicts
+                      if v in ("clean", "watermarked")]
+            if len(judged) >= 2 and all(v == "watermarked"
+                                        for v in judged):
+                print(f"  ⚑ 采样 {len(judged)} 集均有水印 → 弃剧"
+                      f"（全集未拉、其余未下）", flush=True)
                 n_new += 1
-                print("  ⚑ 本部完成（采样跳过）")
+                print("  ⚑ 本部完成（采样弃剧）")
                 continue
-            todo = head + rest  # 部分判定过的集继续由下方循环跳过(done)
-        for j, ep in todo:
+            print("  (采样通过 → 拉取全集…)", flush=True)
+            try:
+                eps, complete = collect_collection(
+                    it["aweme_id"], it.get("sec_uid") or "",
+                    mix_id=str(it.get("mix_id") or ""), mix_name=name)
+            except ds.SearchError as e:
+                print(f"  !! 拉全集失败: {e}")
+                continue
+        # 滑动偶发不全：拿到的全已下载且数量偏少 → 重拉一次
+        if (eps and len(eps) < 8
+                and all(ep["aweme_id"] in done_ids for ep in eps)):
+            print("  ↳ 疑似滑动不全，重拉一次…", flush=True)
+            try:
+                eps2, _ = collect_collection(
+                    it["aweme_id"], it.get("sec_uid") or "",
+                    mix_id=str(it.get("mix_id") or ""), mix_name=name)
+            except ds.SearchError:
+                eps2 = []
+            if len(eps2) > len(eps):
+                eps = eps2
+        if len(eps) < 2:
+            print("  ↳ 只拿到 1 集（非完整剧集），跳过")
+            continue
+        cont, why = ds.looks_continuous(eps)
+        print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
+        if all(ep["aweme_id"] in done_ids for ep in eps):
+            print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
+            stat["skip_done"] += 1
+            continue
+        print(f"  共 {len(eps)} 集 → {sdir}")
+        for j, ep in enumerate(eps, 1):
             if ep["aweme_id"] in done_ids:
                 continue
-            fetch_and_judge(ep, j)
+            fetch_and_judge(ep, j, len(eps))
         n_new += 1
         print("  ⚑ 本部完成")
     print(f"\n==== 结束 ====")
