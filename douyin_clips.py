@@ -28,6 +28,11 @@ import watermark_filter as wf
 
 FRAMES = 3  # 用户指定：散片只抽 3 帧
 
+# root 入口 type=general 走综合搜索接口(general/search/single),
+# 视频/精选路由走 search/item —— 两种都要监听
+CLIP_SEARCH_PREFIXES = ("aweme/v1/web/search/item/",
+                        "aweme/v1/web/general/search/single/")
+
 
 # ---------- selftest ----------
 
@@ -133,7 +138,7 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
 
             def on_response(resp):
                 nonlocal raw
-                if ds.SEARCH_URL_PREFIX not in resp.url:
+                if not any(p in resp.url for p in CLIP_SEARCH_PREFIXES):
                     return
                 try:
                     payload = ds.resp_json(resp)
