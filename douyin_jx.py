@@ -461,29 +461,19 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 verdicts.append(fetch_and_judge(ep, j, len(eps)))
             eff = [v for v in verdicts
                    if v in ("clean", "watermarked")]
-            # 前几集任一有水印 → 弃剧（后续逻辑全不走）
-            head_eff = [v for v in verdicts[:sample]
-                        if v in ("clean", "watermarked")]
-            if any(v == "watermarked" for v in head_eff):
-                print("  ⚑ 前几集采样即有水印 → 弃剧（后续逻辑全跳过）",
+            # 统一规则：采样4集中任一有水印 → 弃剧（无慢路径）
+            if any(v == "watermarked" for v in eff):
+                wm_n = sum(1 for v in eff if v == "watermarked")
+                print(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
                       flush=True)
-                record_abandon("前几集采样即有水印")
+                record_abandon(f"采样{wm_n}/{len(eff)}集有水印")
                 n_new += 1
                 print("  ⚑ 本部完成（采样弃剧）")
                 continue
-            # 尾部2集均有水印 = 作者中途加印（前净后脏），中后期基本全有
-            # → 弃剧（前2集已下载的干净集保留），省掉整部下载+判定
-            tail_eff = [v for v in verdicts[sample:]
-                        if v in ("clean", "watermarked")]
-            if (len(tail_eff) >= 2
-                    and all(v == "watermarked" for v in tail_eff)):
-                print(f"  ⚑ 尾部{len(tail_eff)}集均有水印"
-                      f"（作者中途加印）→ 弃剧", flush=True)
-                record_abandon("尾部集均有水印(作者中途加印)")
-                n_new += 1
-                print("  ⚑ 本部完成（尾部弃剧）")
-                continue
-            if eff and all(v == "clean" for v in eff):
+            # 全净才免判中间；且要求至少 2*sample-1 集有效判定
+            # （防识图失败被当成通过）
+            if (len(eff) >= 2 * sample - 1
+                    and all(v == "clean" for v in eff)):
                 skip_judge = True
                 mid = len(eps) - 2 * sample
                 print(f"  ⚑ 首尾{len(eff)}集均无水印 → 中间 {mid} 集"
