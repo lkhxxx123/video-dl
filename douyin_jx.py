@@ -300,262 +300,275 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 | ds.existing_ids_under(ds.DOWNLOADS_DIR))
     print(f"起点: 已处理 {len(done_ids)} 条")
 
-    print(f"\n=== 精选搜索（目标新下载 {limit} 部剧）===")
-    pool = ds.collect_many(keywords, limit * 4, *filters, seen=done_ids,
-                           block_keywords=block_keywords,
-                           prefer_jingxuan=True,
-                           min_duration=min_duration)
-    series_all, total_found = pick_series(pool, 10 ** 6)
-    print(f"\n候选中带合集标记: {total_found} 部（已完整的自动跳过，不占配额）")
-    if not series_all:
-        print("!! 没有带合集标记的候选（可放宽点赞阈值或换关键词）")
-        return
-
     stat = {"clean": 0, "wm": 0, "skip_done": 0, "nojudge": 0}
     n_new = 0
-    for i, it in enumerate(series_all, 1):
-        if n_new >= limit:
+    rnd = 0
+    # 轮次循环: 单轮池(limit*4)筛弃后常不够数(实测12候选只保5部),
+    # 处理完本轮候选仍 n_new<limit → 再收集一轮, 直到达标或翻尽
+    series_all = []
+    while n_new < limit:
+        rnd += 1
+        print(f"\n=== 精选搜索 第{rnd}轮（目标新下载 {limit} 部剧）===")
+        pool = ds.collect_many(keywords, limit * 4, *filters,
+                               seen=done_ids,
+                               block_keywords=block_keywords,
+                               prefer_jingxuan=True,
+                               min_duration=min_duration)
+        series_all, total_found = pick_series(pool, 10 ** 6)
+        print(f"\n候选中带合集标记: {total_found} 部"
+              f"（已完整的自动跳过，不占配额）")
+        if not series_all:
+            if rnd == 1:
+                print("!! 没有带合集标记的候选（可放宽点赞阈值或换关键词）")
+            else:
+                print("!! 关键词已翻尽，没有更多新合集")
             break
-        name = it.get("mix_name") or (it["title"][:20] or "未命名剧集")
-        print(f"\n=== 剧集 [候选{i}] {name[:24]} ===")
-        if it.get("sec_uid"):
-            print(f"作者: {it.get('nick') or '?'}  "
-                  f"主页: https://www.douyin.com/user/{it['sec_uid']}")
-        print(f"入口视频: {it['aweme_id']}")
-        mid_str = str(it.get("mix_id") or "")
-        if mid_str in skip_list:
-            rec = skip_list[mid_str]
-            print(f"  ↳ 已弃剧记录（{rec.get('date', '?')} "
-                  f"{rec.get('reason', '')}），直接跳过")
-            stat["skip_done"] += 1
-            continue
+        for i, it in enumerate(series_all, 1):
+            if n_new >= limit:
+                break
+        for i, it in enumerate(series_all, 1):
+            if n_new >= limit:
+                break
+            name = it.get("mix_name") or (it["title"][:20] or "未命名剧集")
+            print(f"\n=== 剧集 [候选{i}] {name[:24]} ===")
+            if it.get("sec_uid"):
+                print(f"作者: {it.get('nick') or '?'}  "
+                      f"主页: https://www.douyin.com/user/{it['sec_uid']}")
+            print(f"入口视频: {it['aweme_id']}")
+            mid_str = str(it.get("mix_id") or "")
+            if mid_str in skip_list:
+                rec = skip_list[mid_str]
+                print(f"  ↳ 已弃剧记录（{rec.get('date', '?')} "
+                      f"{rec.get('reason', '')}），直接跳过")
+                stat["skip_done"] += 1
+                continue
 
-        def record_abandon(reason, count=None):
-            if mid_str:
-                skip_list[mid_str] = {"name": name[:40],
-                                      "reason": reason,
-                                      "date": time.strftime("%Y-%m-%d")}
+            def record_abandon(reason, count=None):
+                if mid_str:
+                    skip_list[mid_str] = {"name": name[:40],
+                                          "reason": reason,
+                                          "date": time.strftime("%Y-%m-%d")}
+                    try:
+                        skip_path.write_text(
+                            json.dumps(skip_list, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+                    except Exception:
+                        pass
+                # 目录改名: 前置弃用标记 + 集数（不影响去重——去重靠文件
+                # 名尾部ID）
                 try:
-                    skip_path.write_text(
-                        json.dumps(skip_list, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+                    if sdir.is_dir() and not sdir.name.startswith(
+                            "有水印弃用-"):
+                        tag = "有水印弃用-" + ds.safe_dir_name(name)
+                        if count:
+                            tag += f"({count}集)"
+                        sdir.rename(sdir.with_name(tag))
+                        print(f"  ↳ 目录已标记: {tag}", flush=True)
                 except Exception:
                     pass
-            # 目录改名: 前置弃用标记 + 集数（不影响去重——去重靠文件
-            # 名尾部ID）
-            try:
-                if sdir.is_dir() and not sdir.name.startswith(
-                        "有水印弃用-"):
-                    tag = "有水印弃用-" + ds.safe_dir_name(name)
-                    if count:
-                        tag += f"({count}集)"
-                    sdir.rename(sdir.with_name(tag))
-                    print(f"  ↳ 目录已标记: {tag}", flush=True)
-            except Exception:
-                pass
 
-        # 认领已有目录（含已改名 剧名(N集) 的），防止改名后目录分裂
-        base = ds.safe_dir_name(name)
-        sdir = out_dir / "剧集" / base
-        jdir = out_dir / "剧集"
-        if jdir.is_dir():
-            for d in sorted(jdir.iterdir()):
-                if (d.is_dir() and d.name.startswith(base)
-                        and not d.name.startswith("有水印弃用-")):
-                    sdir = d
-                    break
-        q = sdir / "疑似水印"
+            # 认领已有目录（含已改名 剧名(N集) 的），防止改名后目录分裂
+            base = ds.safe_dir_name(name)
+            sdir = out_dir / "剧集" / base
+            jdir = out_dir / "剧集"
+            if jdir.is_dir():
+                for d in sorted(jdir.iterdir()):
+                    if (d.is_dir() and d.name.startswith(base)
+                            and not d.name.startswith("有水印弃用-")):
+                        sdir = d
+                        break
+            q = sdir / "疑似水印"
 
-        def fetch_and_judge(ep, j, total_eps):
-            """下载并判定单集。返回 clean/watermarked/skip/error。"""
-            evid = ep["aweme_id"]
-            done_ids.add(evid)
-            prefix = ds.episode_prefix(ep.get("ep") or j, total_eps)
-            try:
-                douyin_dl.run(f"https://www.douyin.com/video/{evid}",
-                              sdir, name_prefix=prefix)
-            except douyin_dl.ParseError as e:
-                state["processed"][evid] = {"verdict": "skip",
-                                            "desc": str(e)}
+            def fetch_and_judge(ep, j, total_eps):
+                """下载并判定单集。返回 clean/watermarked/skip/error。"""
+                evid = ep["aweme_id"]
+                done_ids.add(evid)
+                prefix = ds.episode_prefix(ep.get("ep") or j, total_eps)
+                try:
+                    douyin_dl.run(f"https://www.douyin.com/video/{evid}",
+                                  sdir, name_prefix=prefix)
+                except douyin_dl.ParseError as e:
+                    state["processed"][evid] = {"verdict": "skip",
+                                                "desc": str(e)}
+                    douyin_auto.save_state(out_dir, state)
+                    return "skip"
+                except Exception as e:  # noqa: BLE001 - 单集失败不中断
+                    print(f"  {prefix}下载失败（重跑续传）: {e}")
+                    time.sleep(2)
+                    return "error"
+                f = douyin_auto.find_by_id(sdir, evid)
+                if not f:
+                    return "error"
+                try:
+                    v = douyin_auto.judge_file(f, api_key, base_url, model,
+                                               frames_n, sdir / ".wm_frames")
+                except Exception as e:  # noqa: BLE001 - 识图失败保留重判
+                    print(f"  {prefix}识图失败（保留，重跑重判）: {e}")
+                    return "error"
+                if v.get("has_author_watermark"):
+                    q.mkdir(exist_ok=True)
+                    shutil.move(str(f), str(wf.unique_dest(q / f.name)))
+                    state["processed"][evid] = {
+                        "verdict": "watermarked",
+                        "desc": v.get("desc", "")[:60]}
+                    print(f"  ⚠ {prefix}有作者水印 → 移走")
+                    stat["wm"] += 1
+                else:
+                    state["processed"][evid] = {"verdict": "clean"}
+                    print(f"  ✓ {prefix}干净")
+                    stat["clean"] += 1
                 douyin_auto.save_state(out_dir, state)
-                return "skip"
-            except Exception as e:  # noqa: BLE001 - 单集失败不中断
-                print(f"  {prefix}下载失败（重跑续传）: {e}")
-                time.sleep(2)
-                return "error"
-            f = douyin_auto.find_by_id(sdir, evid)
-            if not f:
-                return "error"
-            try:
-                v = douyin_auto.judge_file(f, api_key, base_url, model,
-                                           frames_n, sdir / ".wm_frames")
-            except Exception as e:  # noqa: BLE001 - 识图失败保留重判
-                print(f"  {prefix}识图失败（保留，重跑重判）: {e}")
-                return "error"
-            if v.get("has_author_watermark"):
-                q.mkdir(exist_ok=True)
-                shutil.move(str(f), str(wf.unique_dest(q / f.name)))
+                time.sleep(random.uniform(1, 2))
+                return "watermarked" if v.get("has_author_watermark") else "clean"
+
+            def download_only(ep, j):
+                """首尾采样通过后：只下载不判定（省识图调用）。"""
+                evid = ep["aweme_id"]
+                done_ids.add(evid)
+                prefix = ds.episode_prefix(ep.get("ep") or j, len(eps))
+                try:
+                    douyin_dl.run(f"https://www.douyin.com/video/{evid}",
+                                  sdir, name_prefix=prefix)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  {prefix}下载失败（重跑续传）: {e}")
+                    time.sleep(2)
+                    return
                 state["processed"][evid] = {
-                    "verdict": "watermarked",
-                    "desc": v.get("desc", "")[:60]}
-                print(f"  ⚠ {prefix}有作者水印 → 移走")
-                stat["wm"] += 1
-            else:
-                state["processed"][evid] = {"verdict": "clean"}
-                print(f"  ✓ {prefix}干净")
-                stat["clean"] += 1
-            douyin_auto.save_state(out_dir, state)
-            time.sleep(random.uniform(1, 2))
-            return "watermarked" if v.get("has_author_watermark") else "clean"
+                    "verdict": "nojudge",
+                    "desc": "首尾采样均无水印，跳过判定"}
+                douyin_auto.save_state(out_dir, state)
+                print(f"  ↓ {prefix}已下载（未判定）")
+                stat["nojudge"] += 1
+                time.sleep(random.uniform(1, 2))
 
-        def download_only(ep, j):
-            """首尾采样通过后：只下载不判定（省识图调用）。"""
-            evid = ep["aweme_id"]
-            done_ids.add(evid)
-            prefix = ds.episode_prefix(ep.get("ep") or j, len(eps))
-            try:
-                douyin_dl.run(f"https://www.douyin.com/video/{evid}",
-                              sdir, name_prefix=prefix)
-            except Exception as e:  # noqa: BLE001
-                print(f"  {prefix}下载失败（重跑续传）: {e}")
-                time.sleep(2)
-                return
-            state["processed"][evid] = {
-                "verdict": "nojudge",
-                "desc": "首尾采样均无水印，跳过判定"}
-            douyin_auto.save_state(out_dir, state)
-            print(f"  ↓ {prefix}已下载（未判定）")
-            stat["nojudge"] += 1
-            time.sleep(random.uniform(1, 2))
-
-        # 采样提速①：集合一够采样量就提前返回，先下前几集验水印；
-        # 全有水印 → 弃剧（全集没滑完、其余没下载，最快路径）
-        early = sample if (sample or 0) >= 2 else 0
-        try:
-            eps, complete = collect_collection(
-                it["aweme_id"], it.get("sec_uid") or "",
-                mix_id=str(it.get("mix_id") or ""), mix_name=name,
-                early_stop=early)
-        except ds.SearchError as e:
-            print(f"  !! 拉合集失败: {e}")
-            continue
-        if not complete and len(eps) >= 2:
-            head = ds.sort_episodes(eps)[:sample]
-            verdicts = [fetch_and_judge(ep, j, max(len(eps), sample))
-                        for j, ep in enumerate(head, 1)]
-            judged = [v for v in verdicts
-                      if v in ("clean", "watermarked")]
-            # 前几集任一有水印 → 开头就挂印，后面逻辑全不走（用户规则）
-            if any(v == "watermarked" for v in judged):
-                print(f"  ⚑ 前{len(judged)}集采样即有水印"
-                      f"（{sum(1 for v in judged if v == 'watermarked')}"
-                      f"/{len(judged)}）→ 弃剧（后续逻辑全跳过）", flush=True)
-                record_abandon("前几集采样即有水印")
-                stat["abandoned"] = stat.get("abandoned", 0) + 1
-                print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
-                continue
-            print("  (采样通过 → 冲刺翻页拉取全剧集目录（只取列表不下载）…)",
-                  flush=True)
+            # 采样提速①：集合一够采样量就提前返回，先下前几集验水印；
+            # 全有水印 → 弃剧（全集没滑完、其余没下载，最快路径）
+            early = sample if (sample or 0) >= 2 else 0
             try:
                 eps, complete = collect_collection(
                     it["aweme_id"], it.get("sec_uid") or "",
                     mix_id=str(it.get("mix_id") or ""), mix_name=name,
-                    fast=True)
+                    early_stop=early)
             except ds.SearchError as e:
-                print(f"  !! 拉全集失败: {e}")
+                print(f"  !! 拉合集失败: {e}")
                 continue
-        # 滑动偶发不全：拿到的全已下载且数量偏少 → 重拉一次
-        if (eps and len(eps) < 8
-                and all(ep["aweme_id"] in done_ids for ep in eps)):
-            print("  ↳ 疑似滑动不全，重拉一次…", flush=True)
-            try:
-                eps2, _ = collect_collection(
-                    it["aweme_id"], it.get("sec_uid") or "",
-                    mix_id=str(it.get("mix_id") or ""), mix_name=name)
-            except ds.SearchError:
-                eps2 = []
-            if len(eps2) > len(eps):
-                eps = eps2
-        # 合并总集拦截（全集列表到手后、采样下载前——最快拦截点）
-        comp, n_long, m = is_compilation(eps, max_ep_duration)
-        if comp:
-            print(f"  ⚑ 合并总集类合集（{n_long}/{m} 集超 "
-                  f"{max_ep_duration // 60} 分钟）→ 弃剧", flush=True)
-            record_abandon(f"合并总集({n_long}/{m}集超{max_ep_duration}s)")
-            stat["abandoned"] = stat.get("abandoned", 0) + 1
-            print("  ⚑ 本部完成（合并总集弃剧，不占配额）")
-            continue
-        if len(eps) < 2:
-            print("  ↳ 只拿到 1 集（非完整剧集），跳过")
-            continue
-        cont, why = ds.looks_continuous(eps)
-        print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
-        if all(ep["aweme_id"] in done_ids for ep in eps):
-            print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
-            stat["skip_done"] += 1
-            continue
-        print(f"  共 {len(eps)} 集 → {sdir}")
-        # 采样提速③：首2集已判过 → 此处直接下载最后2集判定；
-        # 均无水印 → 中间集只下载不判定（首集抓"从头有水印"，
-        # 尾集抓"中途才加水印"——作者涨粉后加印常见）
-        # 门槛从 >2*sample 放宽到 >=2：4集小合集首尾采样即全集，
-        # 任何一集有水印同样弃用（实测漏网：3部4集合集各1集水印未标记）
-        skip_judge = False
-        if (sample or 0) >= 2 and len(eps) >= 2:
-            tail_pending = [ep for ep in eps[-sample:]
-                            if ep["aweme_id"] not in done_ids]
-            if tail_pending:
-                print(f"  → 直接下载最后 {len(tail_pending)} 集采样判定…",
-                      flush=True)
-            positions = (list(enumerate(eps[:sample], 1))
-                         + list(enumerate(eps[-sample:],
-                                          len(eps) - sample + 1)))
-            verdicts = []
-            for j, ep in positions:
-                evid = ep["aweme_id"]
-                if evid in done_ids:
-                    verdicts.append(
-                        state["processed"].get(evid, {}).get("verdict")
-                        or "unknown")
+            if not complete and len(eps) >= 2:
+                head = ds.sort_episodes(eps)[:sample]
+                verdicts = [fetch_and_judge(ep, j, max(len(eps), sample))
+                            for j, ep in enumerate(head, 1)]
+                judged = [v for v in verdicts
+                          if v in ("clean", "watermarked")]
+                # 前几集任一有水印 → 开头就挂印，后面逻辑全不走（用户规则）
+                if any(v == "watermarked" for v in judged):
+                    print(f"  ⚑ 前{len(judged)}集采样即有水印"
+                          f"（{sum(1 for v in judged if v == 'watermarked')}"
+                          f"/{len(judged)}）→ 弃剧（后续逻辑全跳过）", flush=True)
+                    record_abandon("前几集采样即有水印")
+                    stat["abandoned"] = stat.get("abandoned", 0) + 1
+                    print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
                     continue
-                verdicts.append(fetch_and_judge(ep, j, len(eps)))
-            eff = [v for v in verdicts
-                   if v in ("clean", "watermarked")]
-            # 统一规则：采样4集中任一有水印 → 弃剧（无慢路径）
-            if any(v == "watermarked" for v in eff):
-                wm_n = sum(1 for v in eff if v == "watermarked")
-                print(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
+                print("  (采样通过 → 冲刺翻页拉取全剧集目录（只取列表不下载）…)",
                       flush=True)
-                record_abandon(f"采样{wm_n}/{len(eff)}集有水印",
-                               count=len(eps))
+                try:
+                    eps, complete = collect_collection(
+                        it["aweme_id"], it.get("sec_uid") or "",
+                        mix_id=str(it.get("mix_id") or ""), mix_name=name,
+                        fast=True)
+                except ds.SearchError as e:
+                    print(f"  !! 拉全集失败: {e}")
+                    continue
+            # 滑动偶发不全：拿到的全已下载且数量偏少 → 重拉一次
+            if (eps and len(eps) < 8
+                    and all(ep["aweme_id"] in done_ids for ep in eps)):
+                print("  ↳ 疑似滑动不全，重拉一次…", flush=True)
+                try:
+                    eps2, _ = collect_collection(
+                        it["aweme_id"], it.get("sec_uid") or "",
+                        mix_id=str(it.get("mix_id") or ""), mix_name=name)
+                except ds.SearchError:
+                    eps2 = []
+                if len(eps2) > len(eps):
+                    eps = eps2
+            # 合并总集拦截（全集列表到手后、采样下载前——最快拦截点）
+            comp, n_long, m = is_compilation(eps, max_ep_duration)
+            if comp:
+                print(f"  ⚑ 合并总集类合集（{n_long}/{m} 集超 "
+                      f"{max_ep_duration // 60} 分钟）→ 弃剧", flush=True)
+                record_abandon(f"合并总集({n_long}/{m}集超{max_ep_duration}s)")
                 stat["abandoned"] = stat.get("abandoned", 0) + 1
-                print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
+                print("  ⚑ 本部完成（合并总集弃剧，不占配额）")
                 continue
-            # 全净才免判中间；且要求至少 2*sample-1 集有效判定
-            # （防识图失败被当成通过）
-            if (len(eff) >= min(len(eps), 2 * sample - 1)
-                    and all(v == "clean" for v in eff)):
-                skip_judge = True
-                mid = max(len(eps) - 2 * sample, 0)
-                print(f"  ⚑ 采样{len(eff)}集均无水印 → 其余 {mid} 集"
-                      f"只下载不判定", flush=True)
-        for j, ep in enumerate(eps, 1):
-            if ep["aweme_id"] in done_ids:
+            if len(eps) < 2:
+                print("  ↳ 只拿到 1 集（非完整剧集），跳过")
                 continue
-            if skip_judge:
-                download_only(ep, j)
-            else:
-                fetch_and_judge(ep, j, len(eps))
-        # 成功保留: 目录名加集数（幂等，已带括号则跳过）
-        try:
-            target = f"{base}({len(eps)}集)"
-            if sdir.is_dir() and sdir.name != target                     and not sdir.name.startswith("有水印弃用-"):
-                sdir.rename(sdir.with_name(target))
-                print(f"  ↳ 目录改名: {target}", flush=True)
-        except Exception:
-            pass
-        n_new += 1
-        print("  ⚑ 本部完成")
+            cont, why = ds.looks_continuous(eps)
+            print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
+            if all(ep["aweme_id"] in done_ids for ep in eps):
+                print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
+                stat["skip_done"] += 1
+                continue
+            print(f"  共 {len(eps)} 集 → {sdir}")
+            # 采样提速③：首2集已判过 → 此处直接下载最后2集判定；
+            # 均无水印 → 中间集只下载不判定（首集抓"从头有水印"，
+            # 尾集抓"中途才加水印"——作者涨粉后加印常见）
+            # 门槛从 >2*sample 放宽到 >=2：4集小合集首尾采样即全集，
+            # 任何一集有水印同样弃用（实测漏网：3部4集合集各1集水印未标记）
+            skip_judge = False
+            if (sample or 0) >= 2 and len(eps) >= 2:
+                tail_pending = [ep for ep in eps[-sample:]
+                                if ep["aweme_id"] not in done_ids]
+                if tail_pending:
+                    print(f"  → 直接下载最后 {len(tail_pending)} 集采样判定…",
+                          flush=True)
+                positions = (list(enumerate(eps[:sample], 1))
+                             + list(enumerate(eps[-sample:],
+                                              len(eps) - sample + 1)))
+                verdicts = []
+                for j, ep in positions:
+                    evid = ep["aweme_id"]
+                    if evid in done_ids:
+                        verdicts.append(
+                            state["processed"].get(evid, {}).get("verdict")
+                            or "unknown")
+                        continue
+                    verdicts.append(fetch_and_judge(ep, j, len(eps)))
+                eff = [v for v in verdicts
+                       if v in ("clean", "watermarked")]
+                # 统一规则：采样4集中任一有水印 → 弃剧（无慢路径）
+                if any(v == "watermarked" for v in eff):
+                    wm_n = sum(1 for v in eff if v == "watermarked")
+                    print(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
+                          flush=True)
+                    record_abandon(f"采样{wm_n}/{len(eff)}集有水印",
+                                   count=len(eps))
+                    stat["abandoned"] = stat.get("abandoned", 0) + 1
+                    print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
+                    continue
+                # 全净才免判中间；且要求至少 2*sample-1 集有效判定
+                # （防识图失败被当成通过）
+                if (len(eff) >= min(len(eps), 2 * sample - 1)
+                        and all(v == "clean" for v in eff)):
+                    skip_judge = True
+                    mid = max(len(eps) - 2 * sample, 0)
+                    print(f"  ⚑ 采样{len(eff)}集均无水印 → 其余 {mid} 集"
+                          f"只下载不判定", flush=True)
+            for j, ep in enumerate(eps, 1):
+                if ep["aweme_id"] in done_ids:
+                    continue
+                if skip_judge:
+                    download_only(ep, j)
+                else:
+                    fetch_and_judge(ep, j, len(eps))
+            # 成功保留: 目录名加集数（幂等，已带括号则跳过）
+            try:
+                target = f"{base}({len(eps)}集)"
+                if sdir.is_dir() and sdir.name != target                     and not sdir.name.startswith("有水印弃用-"):
+                    sdir.rename(sdir.with_name(target))
+                    print(f"  ↳ 目录改名: {target}", flush=True)
+            except Exception:
+                pass
+            n_new += 1
+            print("  ⚑ 本部完成")
     print(f"\n==== 结束 ====")
     print(f"成功保留 {n_new} 部 / 弃用 {stat.get('abandoned', 0)} 部"
           f" / 已完整跳过 {stat['skip_done']} 部"

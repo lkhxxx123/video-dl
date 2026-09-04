@@ -348,14 +348,14 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
 
     成功返回合格列表；验证超时/无数据抛 SearchError（由调用方决定是否继续）。
     """
-    if seen is None:
-        seen = set()
-    kept, raw = [], 0
+    done = seen if seen is not None else set()
+    seen_local = set()  # 本轮解析去重(不含历史; 已见条目计入 scanned 推进)
+    kept, raw, scanned = [], 0, 0
     state = {"verify": False, "prompted": False, "prompted_at": 0.0,
              "reloaded": False}
 
     def on_response(resp):
-        nonlocal raw
+        nonlocal raw, scanned
         if SEARCH_URL_PREFIX not in resp.url:
             return
         try:
@@ -366,7 +366,10 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
             state["verify"] = True
             return
         state["verify"] = False
-        for it in parse_search_response(payload, seen):
+        for it in parse_search_response(payload, seen_local):
+            scanned += 1
+            if it["aweme_id"] in done:
+                continue  # 历史/前轮已见: 静默跳过但计入推进
             raw += 1
             ok, reason = passes_filter(it, max_followers, max_duration,
                                        max_likes, min_duration)
@@ -394,9 +397,9 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
                       if resp else "?")
             _wait_captcha(page)
             probe_deadline = time.time() + 12
-            while raw == 0 and time.time() < probe_deadline:
+            while scanned == 0 and time.time() < probe_deadline:
                 page.wait_for_timeout(1500)
-            if raw:
+            if scanned:
                 extra = f"（被跳转到 {landed}）" if landed != route else ""
                 print(f"  (路由 {route} 命中{extra})", flush=True)
                 break
@@ -405,7 +408,7 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
         # 长等待：等首条有数据的响应；遇软拦截(verify_check)提示用户滑验证。
         # 提示 90s 后仍无数据则刷新页面重发搜索（验证通过后刷新即可拿到）
         first_deadline = time.time() + VERIFY_WAIT
-        while raw == 0 and time.time() < first_deadline:
+        while scanned == 0 and time.time() < first_deadline:
             if state["verify"] and not state["prompted"]:
                 print(">>> 触发滑块验证：请在浏览器窗口中拖动滑块完成拼图 <<<",
                       flush=True)
@@ -420,10 +423,10 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
             page.wait_for_timeout(1500)
         idle = 0
         while len(kept) < limit and idle < MAX_IDLE_SCROLLS:
-            before = raw
+            before = scanned
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(int(SCROLL_WAIT * 1000))
-            idle = 0 if raw > before else idle + 1
+            idle = 0 if scanned > before else idle + 1
     finally:
         page.remove_listener("response", on_response)
     if raw == 0:
