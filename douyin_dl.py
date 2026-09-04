@@ -154,17 +154,23 @@ def record_manifest(out_dir: Path, filename: str, title: str, author: str,
 INVALID_FN_RE = re.compile(r'[\\/:*?"<>|\r\n]')
 
 
-def build_filename(title: str, aweme_id: str, author: str = "") -> str:
-    """标题清洗+截断50字，可附 @作者；ID 恒在末尾（去重/定位依赖）。
+HASHTAG_RE = re.compile(r"#[^\s#]+")
 
-    形如: 标题_@作者_ID.mp4；无作者: 标题_ID.mp4；空标题回退纯 ID。
+
+def build_filename(title: str, aweme_id: str, author: str = "") -> str:
+    """标题去话题标签+清洗+截断50字，附 来源@作者；ID 恒在末尾。
+
+    形如: 标题_来源@作者_ID.mp4；无作者: 标题_ID.mp4；空标题回退纯 ID。
+    话题标签(#xxx)整体剔除；连续空白折叠为单空格。
     """
-    clean = INVALID_FN_RE.sub(" ", title).strip()[:50].strip()
+    t = HASHTAG_RE.sub("", title or "")
+    clean = INVALID_FN_RE.sub(" ", t)
+    clean = re.sub(r"\s+", " ", clean).strip()[:50].strip()
     nick = INVALID_FN_RE.sub(" ", author or "").strip()[:24].strip()
     if not clean:
         clean = nick.lstrip("@")
         nick = ""
-    parts = [p for p in (clean, f"@{nick}" if nick else "",
+    parts = [p for p in (clean, f"来源@{nick}" if nick else "",
                          str(aweme_id)) if p]
     return "_".join(parts) + ".mp4"
 
@@ -559,12 +565,22 @@ def test_build_filename_keeps_normal_title():
 
 def test_build_filename_with_author():
     assert build_filename("标题A", "123", "阿刀Al短剧") == \
-        "标题A_@阿刀Al短剧_123.mp4"
+        "标题A_来源@阿刀Al短剧_123.mp4"
     # 作者名清洗非法字符；ID 恒在末尾
     assert build_filename('t"t', "456", '作/者:名') == \
-        't t_@作 者 名_456.mp4'
-    # 空标题时用作者名兜底（作标题，不带@）
+        't t_来源@作 者 名_456.mp4'
+    # 空标题时用作者名兜底（作标题，不带来源@）
     assert build_filename("", "789", "某人") == "某人_789.mp4"
+
+
+def test_build_filename_strips_hashtags():
+    # 话题标签整体剔除，多余空白折叠
+    assert build_filename(
+        "好看 #AI短剧 #ai漫剧 #抖音ai创作大赛", "1", "作者X") == \
+        "好看_来源@作者X_1.mp4"
+    assert build_filename("纯话题 #只有标签", "2") == "纯话题_2.mp4"
+    # 孤立 # 不构成话题标签，保留；有效标签(#中、#后)剔除
+    assert build_filename("前#中##后 续", "3") == "前# 续_3.mp4"
 
 
 def test_build_filename_fallback_id_only():

@@ -293,67 +293,70 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
 
     clean = sum(1 for v in state["processed"].values()
                 if v.get("verdict") == "clean")
-    while clean < limit:
-        need = limit - clean
-        print(f"\n=== 搜索散片（还需 {need} 条干净）===")
-        batch = collect_clips(keywords, max(need * 2, 8), filters,
-                              block_keywords, done_ids)
-        if not batch:
-            print("!! 没有新候选（关键词翻尽或全被筛选/去重排除）")
-            break
-        progressed = False
-        for it in batch:
-            done_ids.add(it["aweme_id"])
-            if clean >= limit:
+    try:
+        while clean < limit:
+            need = limit - clean
+            print(f"\n=== 搜索散片（还需 {need} 条干净）===")
+            batch = collect_clips(keywords, max(need * 2, 8), filters,
+                                  block_keywords, done_ids)
+            if not batch:
+                print("!! 没有新候选（关键词翻尽或全被筛选/去重排除）")
                 break
-            vid, title = it["aweme_id"], it["title"]
-            if vid in state["processed"]:
-                continue
-            print(f"\n→ [{clean + 1}/{limit}] {title[:32] or vid}")
-            # 10 分钟分桶：与"剧集"同级 → 日期/散片/HH点MM分/
-            cdir = bucket_dir(out_dir)
-            q = cdir / "疑似水印"
-            try:
-                douyin_dl.run(f"https://www.douyin.com/video/{vid}", cdir)
-            except douyin_dl.ParseError as e:
-                state["processed"][vid] = {"verdict": "skip",
-                                           "desc": str(e)}
+            progressed = False
+            for it in batch:
+                done_ids.add(it["aweme_id"])
+                if clean >= limit:
+                    break
+                vid, title = it["aweme_id"], it["title"]
+                if vid in state["processed"]:
+                    continue
+                print(f"\n→ [{clean + 1}/{limit}] {title[:32] or vid}")
+                # 10 分钟分桶：与"剧集"同级 → 日期/散片/HH点MM分/
+                cdir = bucket_dir(out_dir)
+                q = cdir / "疑似水印"
+                try:
+                    douyin_dl.run(f"https://www.douyin.com/video/{vid}", cdir)
+                except douyin_dl.ParseError as e:
+                    state["processed"][vid] = {"verdict": "skip",
+                                               "desc": str(e)}
+                    save_state(out_dir, state)
+                    progressed = True
+                    continue
+                except Exception as e:  # noqa: BLE001 - 失败可重试
+                    print(f"  下载失败（重跑续传）: {e}")
+                    time.sleep(2)
+                    continue
+                f = douyin_auto.find_by_id(cdir, vid)
+                if not f:
+                    continue
+                try:
+                    v = douyin_auto.judge_file(f, api_key, base_url, model,
+                                               FRAMES, cdir / ".wm_frames")
+                except Exception as e:  # noqa: BLE001 - 识图失败保留重判
+                    print(f"  识图失败（保留，重跑重判）: {e}")
+                    continue
+                if v.get("has_author_watermark"):
+                    q.mkdir(exist_ok=True)
+                    shutil.move(str(f), str(wf.unique_dest(q / f.name)))
+                    state["processed"][vid] = {
+                        "verdict": "watermarked",
+                        "desc": v.get("desc", "")[:60]}
+                    print(f"  ⚠ 有作者水印 → 移走")
+                    stat["wm"] += 1
+                else:
+                    state["processed"][vid] = {"verdict": "clean"}
+                    clean += 1
+                    print("  ✓ 干净，计入")
+                    stat["clean"] += 1
                 save_state(out_dir, state)
                 progressed = True
-                continue
-            except Exception as e:  # noqa: BLE001 - 失败可重试
-                print(f"  下载失败（重跑续传）: {e}")
-                time.sleep(2)
-                continue
-            f = douyin_auto.find_by_id(cdir, vid)
-            if not f:
-                continue
-            try:
-                v = douyin_auto.judge_file(f, api_key, base_url, model,
-                                           FRAMES, cdir / ".wm_frames")
-            except Exception as e:  # noqa: BLE001 - 识图失败保留重判
-                print(f"  识图失败（保留，重跑重判）: {e}")
-                continue
-            if v.get("has_author_watermark"):
-                q.mkdir(exist_ok=True)
-                shutil.move(str(f), str(wf.unique_dest(q / f.name)))
-                state["processed"][vid] = {
-                    "verdict": "watermarked",
-                    "desc": v.get("desc", "")[:60]}
-                print(f"  ⚠ 有作者水印 → 移走")
-                stat["wm"] += 1
-            else:
-                state["processed"][vid] = {"verdict": "clean"}
-                clean += 1
-                print("  ✓ 干净，计入")
-                stat["clean"] += 1
-            save_state(out_dir, state)
-            progressed = True
-            time.sleep(random.uniform(1, 2))
-        if not progressed:
-            print("!! 本轮无进展，退出（重跑同命令可再试）")
-            break
-    finalize_buckets(out_dir)
+                time.sleep(random.uniform(1, 2))
+                if not progressed:
+                    print("!! 本轮无进展，退出（重跑同命令可再试）")
+                    break
+    finally:
+        # 无论正常结束/中断(Ctrl+C)/报错，都给桶目录定稿条数
+        finalize_buckets(out_dir)
     print(f"\n==== 结束 ====")
     print(f"干净散片 {clean}/{limit}｜本轮: 干净 {stat['clean']}"
           f" / 水印移走 {stat['wm']}")
