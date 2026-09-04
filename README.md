@@ -21,7 +21,7 @@
 按用户手动流程：精选搜索 → 作者主页合集页 → 点进具体合集滑动拉全 → 逐集下载。
 
 ```cmd
-python run.py jx "AI 短剧 穿越 爽文 爽剧" --limit 10 --max-duration 600 --max-ep-duration 1000 --max-likes 50000 --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py jx "抖音AI创作大赛,AI创作浪潮计划,未来导演扶持计划,短剧新番计划,AI漫剧,AIGC短剧,AI动漫,原创漫剧,穿越古代,重生短剧,逆袭短剧,男频短剧,女频短剧" --limit 10 --max-duration 600 --max-ep-duration 1000 --max-likes 50000 --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |
@@ -47,7 +47,7 @@ python run.py jx "AI 短剧 穿越 爽文 爽剧" --limit 10 --max-duration 600 
 非剧集短视频，独立流程：root 搜索 → 按小时分桶 → 每条 3 帧验水印。
 
 ```cmd
-python run.py clips "AI 短故事" --limit 10 --max-duration 600 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py clips "AI 短故事 AI漫剧,AIGC短剧,AI动漫,原创漫剧,穿越古代,重生短剧,逆袭短剧,男频短剧,女频短剧" --limit 2000 --max-duration 600 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |

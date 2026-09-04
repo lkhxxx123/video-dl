@@ -190,6 +190,78 @@ def is_verify_block(payload: dict) -> bool:
     return nil.get("search_nil_type") == "verify_check"
 
 
+# ---------- 付费检测 ----------
+
+PAID_DETAIL_SUBSTR = "/aweme/v1/web/aweme/detail/"
+
+
+def is_paid_aweme(payload: dict) -> bool:
+    """从 detail 接口响应判定是否付费/试看内容。
+
+    实测(2026-09) 关键字段：aweme_detail.series_info.is_charge == 1
+    （短剧入口挂在收费合集下，整部需要付费解锁；免费 series_info.is_charge=0）。
+    其他维度作为兜底：
+    - series_info.is_charge_series == 1：series/detail 接口的同名同义字段
+    - is_preview == 1：试看模式标记（前 N 秒免费后续需付费）
+    - payment_info / pay_info：单集付费信息块存在
+    - video.video_status ∈ {4, 6}：付费/受限状态码
+
+    返回 False 时不保证非付费——可能是接口未拦截到/字段未对齐，让下游下载
+    404 兜底，避免误伤免费内容。
+    """
+    if not payload:
+        return False
+    data = payload.get("aweme_detail") or payload
+    if not data or not isinstance(data, dict):
+        return False
+    # PRIMARY: 收费合集（实测——免费 series_info.is_charge=0，未挂合集则无 series_info）
+    si = data.get("series_info")
+    if isinstance(si, dict):
+        if si.get("is_charge") == 1 or si.get("is_charge_series") == 1:
+            return True
+    # FALLBACK: 单集付费/试看标记
+    if data.get("is_preview") == 1:
+        return True
+    if data.get("payment_info") or data.get("pay_info"):
+        return True
+    v = data.get("video") or {}
+    if v.get("pay_info") or v.get("payment_info"):
+        return True
+    if v.get("video_status") in (4, 6):
+        return True
+    return False
+
+
+def check_paid_entry(page, entry_aweme_id: str, timeout: int = 15) -> bool:
+    """访问入口视频页，拦截 detail 接口判定是否付费。
+
+    返回 True 表示已确认为付费内容；超时/未拦截到/异常 → False（保守：让
+    下游走完整流程，最终下载 404 时兜底，避免误伤免费内容）。
+    """
+    got = []
+
+    def on_resp(r):
+        if PAID_DETAIL_SUBSTR not in r.url:
+            return
+        p = resp_json(r)
+        if p is not None:
+            got.append(p)
+
+    page.on("response", on_resp)
+    try:
+        page.goto(f"https://www.douyin.com/video/{entry_aweme_id}",
+                  timeout=30000)
+        _wait_captcha(page)
+        deadline = time.time() + timeout
+        while time.time() < deadline and not got:
+            page.wait_for_timeout(1000)
+    finally:
+        page.remove_listener("response", on_resp)
+    if not got:
+        return False
+    return is_paid_aweme(got[0])
+
+
 def split_keywords(text: str):
     """按中英文逗号拆分关键词，去空白与空项。"""
     return [k.strip() for k in re.split(r"[,，]", text) if k.strip()]
@@ -260,6 +332,24 @@ def make_dated_dir(root: Path) -> Path:
     return d
 
 
+def roll_date_dir(cur: dict, on_switch=None) -> Path:
+    """跨午夜翻日期目录（通宵跑场景）：cur["dir"] 名 ≠ 今天 → 切到
+    downloads/新日期/ 并更新 cur["dir"]；同一天原样返回。
+
+    on_switch(旧目录): 切换前回调（散片模式用来给旧目录的桶收尾定稿）。
+    调用粒度由调用方决定——散片每条一查，合集每部剧一查（不拆一部剧）。
+    """
+    today = time.strftime("%Y-%m-%d")
+    if cur["dir"].name != today:
+        old = cur["dir"]
+        if on_switch:
+            on_switch(old)
+        cur["dir"] = make_dated_dir(DOWNLOADS_DIR)
+        print(f"\n↳ 跨过午夜 → 切换日期目录 {old.name} → {cur['dir'].name}",
+              flush=True)
+    return cur["dir"]
+
+
 def existing_ids_under(root: Path) -> set:
     """递归收集 root 下所有 mp4 文件名尾部的视频 ID（跨目录全局去重）。"""
     ids = set()
@@ -274,7 +364,9 @@ def existing_ids_under(root: Path) -> set:
 # ---------- 浏览器层 ----------
 
 @contextmanager
-def open_browser():
+def open_browser(profile_dir: Path = None):
+    """打开持久化登录浏览器。profile_dir 指定独立 profile 目录
+    （散片并行模式传 .browser-profile-clips，与合集互不抢 Chromium 锁）。"""
     if not PLAYWRIGHT_OK:
         raise SearchError(
             "playwright 未安装。先执行: "
@@ -282,7 +374,7 @@ def open_browser():
     try:
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
-                str(PROFILE_DIR), headless=False,
+                str(profile_dir or PROFILE_DIR), headless=False,
                 args=["--disable-blink-features=AutomationControlled"],
                 ignore_default_args=["--enable-automation"],
                 viewport={"width": 1280, "height": 900})
@@ -1010,6 +1102,96 @@ def test_is_verify_block():
     assert is_verify_block({"status_code": 0, "aweme_list": []}) is False
     assert is_verify_block({}) is False
     assert is_verify_block({"search_nil_info": {"search_nil_type": "other"}}) is False
+
+
+# ---------- tests: 付费检测 ----------
+
+def test_is_paid_aweme_series_charge_is_charge():
+    # 实测(2026-09)：收费合集的核心信号——series_info.is_charge=1
+    # 免费入口视频：series_info.is_charge=0；非合集视频：series_info 缺失
+    paid = {"aweme_detail":
+            {"series_info": {"is_charge": 1, "series_id": "7673..."}}}
+    assert is_paid_aweme(paid) is True
+
+
+def test_is_paid_aweme_series_charge_is_charge_series_alias():
+    # series/detail 接口的同义字段名（实测部分响应两种命名都用）
+    paid = {"aweme_detail":
+            {"series_info": {"is_charge_series": 1}}}
+    assert is_paid_aweme(paid) is True
+
+
+def test_is_paid_aweme_series_free():
+    # 免费合集——series_info.is_charge=0 应当不误判
+    free = {"aweme_detail":
+            {"series_info": {"is_charge": 0, "series_id": "7673..."}}}
+    assert is_paid_aweme(free) is False
+
+
+def test_is_paid_aweme_is_preview():
+    # 试看模式（前 N 秒免费，后续需付费）
+    assert is_paid_aweme({"aweme_detail": {"is_preview": 1}}) is True
+
+
+def test_is_paid_aweme_video_status_paid():
+    # 实测：video_status=4 为付费受限
+    assert is_paid_aweme({"aweme_detail":
+                          {"video": {"video_status": 4}}}) is True
+
+
+def test_is_paid_aweme_video_status_restricted():
+    # 实测：video_status=6 为另一种受限
+    assert is_paid_aweme({"aweme_detail":
+                          {"video": {"video_status": 6}}}) is True
+
+
+def test_is_paid_aweme_payment_info():
+    assert is_paid_aweme({"aweme_detail":
+                          {"payment_info": {"amount": 1.0}}}) is True
+
+
+def test_is_paid_aweme_pay_info_nested():
+    # pay_info 在 video 嵌套层（实测部分合集放这里）
+    assert is_paid_aweme({"aweme_detail":
+                          {"video": {"pay_info": {"id": "x"}}}}) is True
+
+
+def test_is_paid_aweme_top_level_shape():
+    # detail 接口偶发无 aweme_detail 包裹，直接是 payload
+    assert is_paid_aweme({"is_preview": 1}) is True
+    assert is_paid_aweme({"video": {"video_status": 4}}) is True
+    # series 字段在顶层也能命中（实测少数响应如此）
+    assert is_paid_aweme({"series_info": {"is_charge": 1}}) is True
+
+
+def test_is_paid_aweme_free_realistic_shape():
+    # 实测(2026-09) 免费入口视频的真实响应：series_info.is_charge=0，
+    # 其余字段（is_preview / video_status / preview_video_status）
+    # 在免费/付费下都常为 None/1，不构成判别信号
+    payload = {"aweme_detail": {
+        "series_info": {"is_charge": 0, "series_id": "7673..."},
+        "is_preview": None,
+        "preview_video_status": 1,
+        "video": {"video_status": None, "pay_info": None,
+                  "payment_info": None},
+        "status": {"listen_video_status": 2, "part_see": 0}}}
+    assert is_paid_aweme(payload) is False
+
+
+def test_is_paid_aweme_no_series_info():
+    # 非合集视频（无 series_info）——不误判（让下游 404 兜底）
+    payload = {"aweme_detail": {
+        "is_preview": None, "preview_video_status": 1,
+        "video": {"video_status": None}}}
+    assert is_paid_aweme(payload) is False
+
+
+def test_is_paid_aweme_empty_or_invalid():
+    # 空/非法输入 → False（保守：让下游 404 兜底）
+    assert is_paid_aweme({}) is False
+    assert is_paid_aweme(None) is False
+    assert is_paid_aweme({"aweme_detail": None}) is False
+    assert is_paid_aweme({"aweme_detail": "garbage"}) is False
 
 
 # ---------- tests: 筛选 ----------

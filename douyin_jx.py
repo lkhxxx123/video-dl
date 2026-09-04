@@ -7,7 +7,8 @@
 ② 进作者主页（等效于视频页右上角点作者名）→ 切到"合集"页
 ③ 在合集页点进具体合集 → 滑动加载当前合集的所有剧集 → 逐集下载+AI验水印
 
-每部剧独立目录 剧集/<剧名>/，集数零填充前缀（01_..），从第 1 集开始；
+每部剧独立目录 剧集/<HH点>/<剧名>/（按下载起始小时分桶，与散片时间桶
+同风格；认领历史目录沿用原位置防分裂），集数零填充前缀（01_..）；
 点赞/粉丝/时长筛选、作者黑名单、全局去重、视频清单与 auto 一致。
 仅限个人离线保存；请尊重创作者版权，勿二次上传。
 """
@@ -62,6 +63,40 @@ def pick_series(pool, limit):
         seen_mix.add(mid)
         series.append(it)
     return series[:limit], len(series)
+
+
+# 剧集目录按下载起始小时分桶（用户需求: 与散片时间桶同风格）
+# 剧集/<HH点>/<剧名>(N集)/；过渡期曾用平铺 HH点_剧名，认领时都要兼容
+HOUR_PREFIX_RE = re.compile(r"^(\d{2}点)_")
+BUCKET_NAME_RE = re.compile(r"^\d{2}点$")
+
+
+def series_dir_core(dname: str) -> str:
+    """目录名去掉可选的 HH点_ 时间前缀（认领匹配用；老目录无前缀原样返回）。"""
+    m = HOUR_PREFIX_RE.match(dname)
+    return dname[m.end():] if m else dname
+
+
+def claim_series_dir(jdir: Path, base: str, hour: str) -> Path:
+    """系列目录定位: 剧集/<hour>/<base>/ 为新默认；先认领历史目录
+    （小时桶内 / 过渡期平铺 HH点_名 / 老式裸名平铺）防续传目录分裂。
+    返回路径（不创建，目录由下载器懒建）。"""
+    fresh = jdir / hour / base
+    if not jdir.is_dir():
+        return fresh
+    cands = []
+    for d in sorted(jdir.iterdir()):
+        if not d.is_dir() or d.name.startswith("有水印弃用-"):
+            continue
+        if BUCKET_NAME_RE.match(d.name):  # 小时桶 → 桶内各剧目录
+            cands.extend(x for x in sorted(d.iterdir()) if x.is_dir())
+        else:  # 平铺（老式裸名 / 过渡期 HH点_名）
+            cands.append(d)
+    for d in cands:
+        if (not d.name.startswith("有水印弃用-")
+                and series_dir_core(d.name).startswith(base)):
+            return d
+    return fresh
 
 
 # 点开合集卡片：从"更新至N集"叶子向上爬到包含剧名的最近容器再点击
@@ -140,6 +175,46 @@ def test_pick_series_dedup_and_limit():
     assert len(got2) == 2 and len({g["mix_id"] for g in got2}) == 2
 
 
+def test_series_dir_core_strips_hour_prefix():
+    # 过渡期平铺目录: HH点_ 前缀剥离后用于认领匹配
+    assert series_dir_core("15点_古井穿越(16集)") == "古井穿越(16集)"
+    assert series_dir_core("09点_未命名剧集") == "未命名剧集"
+    # 老目录（无时间前缀）原样返回，同样能被认领
+    assert series_dir_core("古井穿越(16集)") == "古井穿越(16集)"
+    # 数字开头但非时间前缀的目录名不受影响
+    assert series_dir_core("3天的旅行(5集)") == "3天的旅行(5集)"
+    # "点"后无下划线不视为时间前缀（如剧名本身含"15点"）
+    assert series_dir_core("15点的约定(3集)") == "15点的约定(3集)"
+
+
+def test_claim_series_dir_buckets_and_legacy():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        jdir = Path(td) / "剧集"
+        # 三种历史形态 + 弃用目录
+        (jdir / "19点" / "古井穿越(16集)").mkdir(parents=True)   # 桶内
+        (jdir / "18点_天运纨绔(2集)").mkdir(parents=True)         # 过渡期平铺
+        (jdir / "摄政王的心尖药引(24集)").mkdir(parents=True)     # 老式裸名平铺
+        (jdir / "20点" / "有水印弃用-偏爱女反派(4集)").mkdir(parents=True)
+        # 桶内有同名 → 认领（即使当前小时不同，续传不分裂）
+        assert claim_series_dir(jdir, "古井穿越", "21点") == \
+            jdir / "19点" / "古井穿越(16集)"
+        # 过渡期平铺 → 认领
+        assert claim_series_dir(jdir, "天运纨绔", "21点") == \
+            jdir / "18点_天运纨绔(2集)"
+        # 老式裸名平铺 → 认领
+        assert claim_series_dir(jdir, "摄政王的心尖药引", "21点") == \
+            jdir / "摄政王的心尖药引(24集)"
+        # 弃用目录不认领；全新剧 → 当前小时桶
+        assert claim_series_dir(jdir, "偏爱女反派", "21点") == \
+            jdir / "21点" / "偏爱女反派"
+        assert claim_series_dir(jdir, "新剧", "21点") == \
+            jdir / "21点" / "新剧"
+        # 剧集目录不存在时直接给桶内路径
+        empty = Path(td) / "不存在"
+        assert claim_series_dir(empty, "X", "08点") == empty / "08点" / "X"
+
+
 def test_is_compilation():
     # 10 集中 7 集超 10 分钟 → 合并总集
     eps = [{"dur": 700000}] * 7 + [{"dur": 200000}] * 3
@@ -168,11 +243,18 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
     """作者主页 → 合集页 → 点进具体合集 → 滑动拉全部分集。
 
     返回按集数/发布时间升序的 [{aweme_id, title, ep, ct}]（从第 1 集开始）。
+    入口视频付费则抛 SearchError（由 run() 跳过该合集）。
     """
     target = str(mix_id) if mix_id else ""
     with ds.open_browser() as ctx:
         page = ds._first_page(ctx)
         ds.ensure_login(ctx, page)
+        # 入口视频付费检测：精选搜索可能命中付费合集（整部付费/首集付费试看），
+        # 提早拦截省去作者页+合集卡+滑页一轮空转；下载时也会 404，但入口
+        # 检测能提前归类到"付费跳过"而非"未拦截到合集剧集接口"
+        if entry_video_id and ds.check_paid_entry(page, entry_video_id):
+            raise ds.SearchError(
+                f"入口视频需付费 ({entry_video_id})")
         state = {"target": target, "total": None}
         seen, items = set(), []
 
@@ -300,12 +382,19 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 | ds.existing_ids_under(ds.DOWNLOADS_DIR))
     print(f"起点: 已处理 {len(done_ids)} 条")
 
+    # 可变目录引用: 跨午夜翻日期（通宵跑），每部剧开始前检查——
+    # 粒度=整部剧，绝不在一部剧中途切目录
+    cur = {"dir": out_dir}
     stat = {"clean": 0, "wm": 0, "skip_done": 0, "nojudge": 0}
     n_new = 0
     rnd = 0
     # 轮次循环: 单轮池(limit*4)筛弃后常不够数(实测12候选只保5部),
     # 处理完本轮候选仍 n_new<limit → 再收集一轮, 直到达标或翻尽
     series_all = []
+    # 本 run 已考察过的合集(弃剧/已完整/已保留均算): 跳过的候选不进
+    # done_ids, 若不另记, 轮次循环会反复搜出同一批候选重复跳过——
+    # 实测单日 256 次"已完整跳过"实为约 70 部被跨轮重复计数 4-8 遍
+    seen_mixes = set()
     while n_new < limit:
         rnd += 1
         print(f"\n=== 精选搜索 第{rnd}轮（目标新下载 {limit} 部剧）===")
@@ -323,23 +412,27 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             else:
                 print("!! 关键词已翻尽，没有更多新合集")
             break
+        fresh_this_round = 0
         for i, it in enumerate(series_all, 1):
             if n_new >= limit:
                 break
-        for i, it in enumerate(series_all, 1):
-            if n_new >= limit:
-                break
+            mid_str = str(it.get("mix_id") or "")
+            mix_key = mid_str or f"aweme:{it['aweme_id']}"
+            if mix_key in seen_mixes:
+                continue  # 前面轮次已考察过（弃剧/已完整/已保留）
+            seen_mixes.add(mix_key)
+            fresh_this_round += 1
             name = it.get("mix_name") or (it["title"][:20] or "未命名剧集")
             print(f"\n=== 剧集 [候选{i}] {name[:24]} ===")
             if it.get("sec_uid"):
                 print(f"作者: {it.get('nick') or '?'}  "
                       f"主页: https://www.douyin.com/user/{it['sec_uid']}")
             print(f"入口视频: {it['aweme_id']}")
-            mid_str = str(it.get("mix_id") or "")
             if mid_str in skip_list:
                 rec = skip_list[mid_str]
                 print(f"  ↳ 已弃剧记录（{rec.get('date', '?')} "
                       f"{rec.get('reason', '')}），直接跳过")
+                done_ids.add(it["aweme_id"])  # 后续轮次搜索不再翻出该入口
                 stat["skip_done"] += 1
                 continue
 
@@ -355,7 +448,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     except Exception:
                         pass
                 # 目录改名: 前置弃用标记 + 集数（不影响去重——去重靠文件
-                # 名尾部ID）
+                # 名尾部ID；时间信息在上层小时桶目录名上）
                 try:
                     if sdir.is_dir() and not sdir.name.startswith(
                             "有水印弃用-"):
@@ -367,16 +460,11 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 except Exception:
                     pass
 
-            # 认领已有目录（含已改名 剧名(N集) 的），防止改名后目录分裂
+            # 目录按下载起始小时分桶: 剧集/<HH点>/<剧名>/（与散片时间桶
+            # 同风格）；认领历史目录（桶内/过渡期平铺/老式裸名）防分裂
             base = ds.safe_dir_name(name)
-            sdir = out_dir / "剧集" / base
-            jdir = out_dir / "剧集"
-            if jdir.is_dir():
-                for d in sorted(jdir.iterdir()):
-                    if (d.is_dir() and d.name.startswith(base)
-                            and not d.name.startswith("有水印弃用-")):
-                        sdir = d
-                        break
+            jdir = ds.roll_date_dir(cur) / "剧集"
+            sdir = claim_series_dir(jdir, base, time.strftime("%H点"))
             q = sdir / "疑似水印"
 
             def fetch_and_judge(ep, j, total_eps):
@@ -390,7 +478,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 except douyin_dl.ParseError as e:
                     state["processed"][evid] = {"verdict": "skip",
                                                 "desc": str(e)}
-                    douyin_auto.save_state(out_dir, state)
+                    douyin_auto.save_state(cur["dir"], state)
                     return "skip"
                 except Exception as e:  # noqa: BLE001 - 单集失败不中断
                     print(f"  {prefix}下载失败（重跑续传）: {e}")
@@ -417,7 +505,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     state["processed"][evid] = {"verdict": "clean"}
                     print(f"  ✓ {prefix}干净")
                     stat["clean"] += 1
-                douyin_auto.save_state(out_dir, state)
+                douyin_auto.save_state(cur["dir"], state)
                 time.sleep(random.uniform(1, 2))
                 return "watermarked" if v.get("has_author_watermark") else "clean"
 
@@ -436,7 +524,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 state["processed"][evid] = {
                     "verdict": "nojudge",
                     "desc": "首尾采样均无水印，跳过判定"}
-                douyin_auto.save_state(out_dir, state)
+                douyin_auto.save_state(cur["dir"], state)
                 print(f"  ↓ {prefix}已下载（未判定）")
                 stat["nojudge"] += 1
                 time.sleep(random.uniform(1, 2))
@@ -450,7 +538,13 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     mix_id=str(it.get("mix_id") or ""), mix_name=name,
                     early_stop=early)
             except ds.SearchError as e:
-                print(f"  !! 拉合集失败: {e}")
+                if "入口视频需付费" in str(e):
+                    print(f"  ⚑ 入口视频需付费 → 弃剧", flush=True)
+                    record_abandon("入口视频需付费")
+                    stat["abandoned"] = stat.get("abandoned", 0) + 1
+                    print("  ⚑ 本部完成（付费跳过，不占 limit 配额）")
+                else:
+                    print(f"  !! 拉合集失败: {e}")
                 continue
             if not complete and len(eps) >= 2:
                 head = ds.sort_episodes(eps)[:sample]
@@ -505,6 +599,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
             if all(ep["aweme_id"] in done_ids for ep in eps):
                 print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
+                done_ids.add(it["aweme_id"])  # 入口非分集(导流片), 排除重翻
                 stat["skip_done"] += 1
                 continue
             print(f"  共 {len(eps)} 集 → {sdir}")
@@ -559,16 +654,21 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     download_only(ep, j)
                 else:
                     fetch_and_judge(ep, j, len(eps))
-            # 成功保留: 目录名加集数（幂等，已带括号则跳过）
+            # 成功保留: 目录名加集数（幂等，已带括号则跳过；小时在桶目录上）
             try:
                 target = f"{base}({len(eps)}集)"
-                if sdir.is_dir() and sdir.name != target                     and not sdir.name.startswith("有水印弃用-"):
+                if (sdir.is_dir() and sdir.name != target
+                        and not sdir.name.startswith("有水印弃用-")):
                     sdir.rename(sdir.with_name(target))
                     print(f"  ↳ 目录改名: {target}", flush=True)
             except Exception:
                 pass
             n_new += 1
             print("  ⚑ 本部完成")
+        # 本轮全是已考察过的旧候选 → 再搜也是同一批（防止空转+触发风控）
+        if not fresh_this_round:
+            print("!! 本轮候选均已考察过，关键词翻尽")
+            break
     print(f"\n==== 结束 ====")
     print(f"成功保留 {n_new} 部 / 弃用 {stat.get('abandoned', 0)} 部"
           f" / 已完整跳过 {stat['skip_done']} 部"
