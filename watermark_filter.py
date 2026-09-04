@@ -97,18 +97,20 @@ def extract_frames(video: Path, n: int, workdir: Path):
 # ---------- Qwen-VL 调用 ----------
 
 PROMPT = """你是视频水印审核员。下面是同一个视频按时间顺序抽取的{N}帧截图（第1张最早）。
-找出视频中"作者自加的叠加元素"并分类：
-- account（账号/引流类）：账号名、抖音号、公众号、"感谢关注/求关注"类引流文字、
-  作者半透明 logo。位置固定或移动都算。
-- ai_label（AI标识类）："AI生成"、"内容由AI生成"、"豆包AI生成"等 AI 内容标识，
-  属平台/工具标注，【永远不算作者水印】。
+找出视频中"叠加标识元素"并分类：
+- account（账号/引流类）：作者账号名、抖音号、公众号、"感谢关注/求关注"类
+  引流文字、作者半透明 logo。位置固定或移动都算。
+- platform（平台标识类）：抖音平台角标、抖音 logo、@抖音小助手、DOU+ 等
+  平台叠加标识——【也算水印，需转移】。
+- ai_label（AI标识类）："AI生成"、"内容由AI生成"、"豆包AI生成"等 AI 内容
+  标注，属内容属性说明，【不算水印】。
 - title（标题花字类）：作者叠加的标题、吐槽花字（如黄色描边文案），
-  属内容装饰，【不算作者水印】。
-以下也不算作者水印：抖音平台角标/进度条等 UI、底部居中硬字幕、
-画面场景内自然文字（招牌/手机屏幕/片头标题动画）。
-判定规则：只有存在 account 类元素时 has_author_watermark 才为 true。
+  属内容装饰，【不算水印】。
+以下同样不算水印：进度条等播放器 UI、底部居中硬字幕、画面场景内自然文字
+（招牌/手机屏幕/片头标题动画）。
+判定规则：存在 account 或 platform 类元素时 has_author_watermark 为 true。
 严格只输出 JSON（不要任何多余文字）：
-{{"has_author_watermark": true或false, "type": "account或ai_label或title或空", "moving": true或false, "desc": "简述依据", "frames_with_watermark": [帧序号,从1开始]}}"""
+{{"has_author_watermark": true或false, "type": "account或platform或ai_label或title或空", "moving": true或false, "desc": "简述依据", "frames_with_watermark": [帧序号,从1开始]}}"""
 
 
 def _anthropic_messages_url(base_url: str) -> str:

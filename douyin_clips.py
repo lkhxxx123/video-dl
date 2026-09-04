@@ -4,8 +4,8 @@
 
 用户需求(2026-09-03)：
 ① 搜索入口用 /root/search/{关键词}?type=general（用户指定）
-② 输出 downloads/日期/散片/HH点/ —— 与"剧集"同级；按下载时刻小时分桶，
-   连跑 24 小时 → 散片下 24 个目录
+② 输出 downloads/日期/散片/HH点MM分/ —— 与"剧集"同级；按下载时刻
+   10 分钟分桶（每小时 6 个桶）
 ③ 每条验水印，只抽 3 帧（比合集的 6 帧省一半）
 ④ 不改动合集相关脚本（本文件独立实现收集逻辑）
 仅限个人离线保存；请尊重创作者版权，勿二次上传。
@@ -68,8 +68,9 @@ def clip_routes(keyword: str):
 
 
 def hour_bucket_name(now=None) -> str:
-    """下载时刻的小时桶名（如 '14点'）。跑 24 小时 = 24 个桶。"""
-    return time.strftime("%H点", time.localtime(now))
+    """下载时刻的 10 分钟桶名（如 '14点30分'）。每小时 6 个桶。"""
+    lt = time.localtime(now)
+    return time.strftime("%H点", lt) + f"{(lt.tm_min // 10) * 10:02d}分"
 
 
 # ---------- 测试 ----------
@@ -82,9 +83,14 @@ def test_clip_routes_root_first():
 
 
 def test_hour_bucket_name():
-    assert re.fullmatch(r"\d{2}点", hour_bucket_name())
-    assert hour_bucket_name(time.mktime((2026, 9, 3, 9, 5, 0, 0, 0, -1))) \
-        == "09点"
+    # 10 分钟粒度：分钟向下取整到 10 的倍数
+    assert re.fullmatch(r"\d{2}点\d{2}分", hour_bucket_name())
+    assert hour_bucket_name(
+        time.mktime((2026, 9, 3, 9, 5, 0, 0, 0, -1))) == "09点00分"
+    assert hour_bucket_name(
+        time.mktime((2026, 9, 3, 14, 37, 0, 0, 0, -1))) == "14点30分"
+    assert hour_bucket_name(
+        time.mktime((2026, 9, 3, 23, 59, 0, 0, 0, -1))) == "23点50分"
 
 
 
@@ -231,7 +237,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
             if vid in state["processed"]:
                 continue
             print(f"\n→ [{clean + 1}/{limit}] {title[:32] or vid}")
-            # 小时分桶：与"剧集"同级 → 日期/散片/HH点/
+            # 10 分钟分桶：与"剧集"同级 → 日期/散片/HH点MM分/
             cdir = out_dir / "散片" / hour_bucket_name()
             cdir.mkdir(parents=True, exist_ok=True)
             q = cdir / "疑似水印"
@@ -308,7 +314,7 @@ def main(argv=None):
         sys.exit(1)
     keywords = ds.split_keywords(args.keyword)
     out_dir = ds.make_dated_dir(ds.DOWNLOADS_DIR)
-    print(f"输出目录: {out_dir / '散片'}（按小时分桶）")
+    print(f"输出目录: {out_dir / '散片'}（按 10 分钟分桶）")
     filters = (args.max_followers, args.max_duration, args.max_likes)
     if any(v is not None for v in filters):
         print(f"筛选: 粉丝<{args.max_followers or '∞'} "

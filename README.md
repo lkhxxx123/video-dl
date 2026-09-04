@@ -21,7 +21,7 @@
 按用户手动流程：精选搜索 → 作者主页合集页 → 点进具体合集滑动拉全 → 逐集下载。
 
 ```cmd
-python run.py jx "AI 短剧" --limit 5 --max-duration 600 --max-likes 50000 --block-keywords "搬运,侵权" --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py jx "AI 短剧" --limit 5 --max-duration 600 --max-ep-duration 1000 --max-likes 50000 --block-keywords "搬运,侵权" --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |
@@ -58,10 +58,10 @@ python run.py clips "抖音ai创作大赛" --limit 10 --max-duration 600 --max-l
 | `--block-keywords` | 内置词表 | 同上 |
 
 **行为要点**：
-- 输出 `downloads\日期\散片\HH点\`（与"剧集"同级；按下载时刻小时分桶，
-  连跑 24 小时 = 24 个目录）
+- 输出 `downloads\日期\散片\HH点MM分\`（与"剧集"同级；按下载时刻
+  **10 分钟分桶**，每小时 6 个目录）
 - 每条验水印**只抽 3 帧**（`douyin_clips.py` 顶部 `FRAMES=3` 可改）
-- 有水印 → 该小时目录下 `疑似水印\`
+- 有水印（作者水印 **或抖音平台标识**）→ 该 10 分钟目录下 `疑似水印\`
 - 文件名 `标题_@作者_ID.mp4`（散片无集数前缀）
 
 ---
