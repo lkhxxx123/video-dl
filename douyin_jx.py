@@ -496,8 +496,10 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         # 采样提速③：首2集已判过 → 此处直接下载最后2集判定；
         # 均无水印 → 中间集只下载不判定（首集抓"从头有水印"，
         # 尾集抓"中途才加水印"——作者涨粉后加印常见）
+        # 门槛从 >2*sample 放宽到 >=2：4集小合集首尾采样即全集，
+        # 任何一集有水印同样弃用（实测漏网：3部4集合集各1集水印未标记）
         skip_judge = False
-        if (sample or 0) >= 2 and len(eps) > 2 * sample:
+        if (sample or 0) >= 2 and len(eps) >= 2:
             tail_pending = [ep for ep in eps[-sample:]
                             if ep["aweme_id"] not in done_ids]
             if tail_pending:
@@ -529,11 +531,11 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 continue
             # 全净才免判中间；且要求至少 2*sample-1 集有效判定
             # （防识图失败被当成通过）
-            if (len(eff) >= 2 * sample - 1
+            if (len(eff) >= min(len(eps), 2 * sample - 1)
                     and all(v == "clean" for v in eff)):
                 skip_judge = True
-                mid = len(eps) - 2 * sample
-                print(f"  ⚑ 首尾{len(eff)}集均无水印 → 中间 {mid} 集"
+                mid = max(len(eps) - 2 * sample, 0)
+                print(f"  ⚑ 采样{len(eff)}集均无水印 → 其余 {mid} 集"
                       f"只下载不判定", flush=True)
         for j, ep in enumerate(eps, 1):
             if ep["aweme_id"] in done_ids:
