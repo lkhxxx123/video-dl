@@ -139,11 +139,11 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
                 break
             print(f"\n=== 关键词 [{idx}/{len(keywords)}] {kw}"
                   f"（还需 {pool_size - len(merged)} 条）", flush=True)
-            seen_local, raw = set(), 0
+            seen_local, raw, scanned = set(), 0, 0
             state = {"verify": False, "prompted": False}
 
             def on_response(resp):
-                nonlocal raw
+                nonlocal raw, scanned
                 if not any(p in resp.url for p in CLIP_SEARCH_PREFIXES):
                     return
                 try:
@@ -156,6 +156,7 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
                     state["verify"] = True
                     return
                 for it in ds.parse_search_response(payload, seen_local):
+                    scanned += 1
                     if it["aweme_id"] in done_ids:
                         continue
                     raw += 1
@@ -173,35 +174,37 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
 
             page.on("response", on_response)
             try:
-                route_hit = False
                 for url in clip_routes(kw):
                     page.goto(url, timeout=30000)
                     ds._wait_captcha(page)
                     probe = time.time() + 12
-                    while time.time() < probe and raw == 0:
+                    while time.time() < probe and scanned == 0:
                         page.wait_for_timeout(1500)
-                    if raw:
-                        route_hit = True
+                    if scanned:
                         break
                     print(f"  (路由 {url.split('/')[3]} 无数据，切换…)",
                           flush=True)
                 # 长等待滑块
                 deadline = time.time() + ds.VERIFY_WAIT
-                while raw == 0 and time.time() < deadline:
+                while scanned == 0 and time.time() < deadline:
                     if state["verify"] and not state["prompted"]:
                         print(">>> 触发滑块验证：请在浏览器窗口中拖动完成拼图"
                               " <<<", flush=True)
                         state["prompted"] = True
                     page.wait_for_timeout(1500)
+                # 翻页推进以 scanned(含已下载)计——旧数据页不算"无进展",
+                # 否则二轮搜索翻不过前几页已下载内容
                 idle = 0
                 while len(merged) < pool_size and idle < ds.MAX_IDLE_SCROLLS:
-                    before = raw
+                    before = scanned
                     page.mouse.wheel(0, 2000)
                     page.wait_for_timeout(int(ds.SCROLL_WAIT * 1000))
-                    idle = 0 if raw > before else idle + 1
+                    idle = 0 if scanned > before else idle + 1
             finally:
                 page.remove_listener("response", on_response)
-            print(f"累计候选 {len(merged)}/{pool_size}")
+            print(f"累计候选 {len(merged)}/{pool_size}"
+                  f"（扫描 {scanned} 条，其中已下载跳过 "
+                  f"{scanned - raw} 条）")
             if idx < len(keywords) and len(merged) < pool_size:
                 time.sleep(random.uniform(3, 5))
         return merged[:pool_size]
