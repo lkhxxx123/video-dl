@@ -284,7 +284,8 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
 # ---------- 编排 ----------
 
 def run(keywords, limit, filters, block_keywords, frames_n, api_key,
-        base_url, model, out_dir: Path, sample=2, max_ep_duration=600):
+        base_url, model, out_dir: Path, sample=2, max_ep_duration=600,
+        min_duration=30):
     state = douyin_auto.load_state(out_dir)
     douyin_auto.reconcile_state(out_dir, state)
     # 项目级弃剧名单(跨天): 有水印弃用的合集直接跳过, 不再重复采样
@@ -302,7 +303,8 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
     print(f"\n=== 精选搜索（目标新下载 {limit} 部剧）===")
     pool = ds.collect_many(keywords, limit * 4, *filters, seen=done_ids,
                            block_keywords=block_keywords,
-                           prefer_jingxuan=True)
+                           prefer_jingxuan=True,
+                           min_duration=min_duration)
     series_all, total_found = pick_series(pool, 10 ** 6)
     print(f"\n候选中带合集标记: {total_found} 部（已完整的自动跳过，不占配额）")
     if not series_all:
@@ -571,6 +573,8 @@ def main(argv=None):
     parser.add_argument("--max-followers", type=int, default=None)
     parser.add_argument("--max-duration", type=int, default=None)
     parser.add_argument("--max-likes", type=int, default=None)
+    parser.add_argument("--min-duration", type=int, default=30,
+                        help="时长下限秒(滤过短碎片, 严格大于; 0=关闭, 默认30)")
     parser.add_argument("--block-keywords", default=None,
                         help="作者黑名单关键词; 默认内置搬运/侵权词表, 空串禁用")
     parser.add_argument("--frames", type=int, default=6)
@@ -608,7 +612,8 @@ def main(argv=None):
     try:
         run(keywords, args.limit, filters, block_kw, args.frames, api_key,
             args.base_url, args.model, out_dir, sample=args.sample,
-            max_ep_duration=args.max_ep_duration or None)
+            max_ep_duration=args.max_ep_duration or None,
+            min_duration=args.min_duration or None)
     except KeyboardInterrupt:
         print("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)

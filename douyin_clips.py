@@ -197,7 +197,8 @@ def reconcile_state(out_dir: Path, state: dict) -> None:
 
 # ---------- 收集（独立实现，不动合集脚本） ----------
 
-def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
+def collect_clips(keywords, pool_size, filters, block_keywords, done_ids,
+                  min_duration=None):
     """root/search 搜索收集散片候选（过滤筛选/黑名单/全局去重）。"""
     max_followers, max_duration, max_likes = filters
     with ds.open_browser() as ctx:
@@ -231,7 +232,8 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
                         continue
                     raw += 1
                     ok, reason = ds.passes_filter(
-                        it, max_followers, max_duration, max_likes)
+                        it, max_followers, max_duration, max_likes,
+                        min_duration)
                     if ok:
                         bad, word = ds.author_blocked(it, block_keywords)
                         if bad:
@@ -283,7 +285,7 @@ def collect_clips(keywords, pool_size, filters, block_keywords, done_ids):
 # ---------- 编排 ----------
 
 def run(keywords, limit, filters, block_keywords, api_key, base_url,
-        model, out_dir: Path):
+        model, out_dir: Path, min_duration=None):
     state = load_state(out_dir)
     reconcile_state(out_dir, state)
     done_ids = (set(state["processed"])
@@ -373,6 +375,8 @@ def main(argv=None):
     parser.add_argument("--max-followers", type=int, default=None)
     parser.add_argument("--max-duration", type=int, default=None)
     parser.add_argument("--max-likes", type=int, default=None)
+    parser.add_argument("--min-duration", type=int, default=30,
+                        help="时长下限秒(滤过短碎片, 严格大于; 0=关闭, 默认30)")
     parser.add_argument("--block-keywords", default=None,
                         help="作者黑名单关键词; 默认内置搬运/侵权词表, 空串禁用")
     parser.add_argument("--model", default=wf.DEFAULT_MODEL)
@@ -403,7 +407,8 @@ def main(argv=None):
         block_kw = ds.split_keywords(args.block_keywords)
     try:
         run(keywords, args.limit, filters, block_kw, api_key,
-            args.base_url, args.model, out_dir)
+            args.base_url, args.model, out_dir,
+            min_duration=args.min_duration or None)
     except KeyboardInterrupt:
         print("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)

@@ -178,8 +178,17 @@ def split_keywords(text: str):
 
 
 def passes_filter(item: dict, max_followers=None, max_duration=None,
-                  max_likes=None):
-    """筛选判定：严格小于才保留；启用的条件遇字段未知即拒绝。"""
+                  max_likes=None, min_duration=None):
+    """筛选判定：严格小于/大于才保留；启用的条件遇字段未知即拒绝。
+
+    min_duration: 时长下限（秒），严格大于才保留（滤过短碎片）。
+    """
+    if min_duration:
+        if item["duration_ms"] is None:
+            return False, "时长未知"
+        if item["duration_ms"] <= min_duration * 1000:
+            return False, \
+                f"时长 {item['duration_ms'] // 1000}s <= {min_duration}s"
     if max_likes is not None:
         if item["digg"] is None:
             return False, "点赞数未知"
@@ -315,7 +324,8 @@ def _wait_captcha(page, timeout=90) -> None:
 
 def _collect_page(context, page, keyword, limit, max_followers=None,
                   max_duration=None, max_likes=None, seen=None,
-                  block_keywords=None, prefer_jingxuan=False):
+                  block_keywords=None, prefer_jingxuan=False,
+                  min_duration=None):
     """单个关键词的搜索收集（在已打开的浏览器页签内跳转）。
 
     成功返回合格列表；验证超时/无数据抛 SearchError（由调用方决定是否继续）。
@@ -341,7 +351,7 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
         for it in parse_search_response(payload, seen):
             raw += 1
             ok, reason = passes_filter(it, max_followers, max_duration,
-                                       max_likes)
+                                       max_likes, min_duration)
             if ok:
                 bad, kw = author_blocked(it, block_keywords)
                 if bad:
@@ -408,7 +418,7 @@ def _collect_page(context, page, keyword, limit, max_followers=None,
 
 def collect_many(keywords, limit, max_followers=None, max_duration=None,
                  max_likes=None, seen=None, block_keywords=None,
-                 prefer_jingxuan=False):
+                 prefer_jingxuan=False, min_duration=None):
     """多关键词聚合：开一次浏览器，逐词收集，全局去重，凑够 limit 即停。
 
     seen: 额外提供的"已处理 ID 集合"（流水线复用，跳过历史视频）。
@@ -433,7 +443,8 @@ def collect_many(keywords, limit, max_followers=None, max_duration=None,
                                             max_followers, max_duration,
                                             max_likes, seen_ids,
                                             block_keywords,
-                                            prefer_jingxuan))
+                                            prefer_jingxuan,
+                                            min_duration))
             except SearchError as e:
                 print(f"  !! {e}，跳到下一个关键词", flush=True)
             print(f"累计合格 {len(merged)}/{limit}")
@@ -1002,6 +1013,19 @@ def test_passes_filter_rejects_each_dimension():
                          max_duration=120) == (False, "时长 120s >= 120s")
     assert passes_filter(_item(digg=1000),
                          max_likes=1000) == (False, "点赞 1000 >= 1000")
+
+
+def test_passes_filter_min_duration():
+    ok, _ = passes_filter(_item(duration_ms=31000), min_duration=30)
+    assert ok is True
+    assert passes_filter(_item(duration_ms=30000),
+                         min_duration=30) == (False, "时长 30s <= 30s")
+    assert passes_filter(_item(duration_ms=15000),
+                         min_duration=30)[0] is False
+    assert passes_filter(_item(duration_ms=None),
+                         min_duration=30)[0] is False
+    # 不启用时不受影响
+    assert passes_filter(_item(duration_ms=5000))[0] is True
 
 
 def test_passes_filter_unknown_rejects_only_when_active():
