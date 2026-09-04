@@ -291,8 +291,9 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
     print(f"起点: 已处理 {len(done_ids)} 条")
     stat = {"clean": 0, "wm": 0}
 
-    clean = sum(1 for v in state["processed"].values()
-                if v.get("verdict") == "clean")
+    # --limit 语义: 本轮新增 N 条干净（与 jx 一致）；去重靠 done_ids，
+    # 已下载的天然跳过，不从历史 state 累计（否则换关键词也凑数直接退出）
+    clean = 0
     try:
         while clean < limit:
             need = limit - clean
@@ -358,7 +359,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
         # 无论正常结束/中断(Ctrl+C)/报错，都给桶目录定稿条数
         finalize_buckets(out_dir)
     print(f"\n==== 结束 ====")
-    print(f"干净散片 {clean}/{limit}｜本轮: 干净 {stat['clean']}"
+    print(f"本轮干净散片 {clean}/{limit}｜水印移走 {stat['wm']}"
           f" / 水印移走 {stat['wm']}")
     print(f"散片目录: {out_dir / '散片'}")
 
