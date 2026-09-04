@@ -93,6 +93,76 @@ def test_hour_bucket_name():
         time.mktime((2026, 9, 3, 23, 59, 0, 0, 0, -1))) == "23点50分"
 
 
+def test_bucket_dir_claim_and_finalize():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # 已计数的旧桶 → 认领（不新建）
+        old = root / "散片" / "10点10分(3)"
+        old.mkdir(parents=True)
+        assert bucket_dir(root, base="10点10分") == old
+        # 无旧桶 → 新建裸桶
+        got2 = bucket_dir(root, base="11点20分")
+        assert got2.name == "11点20分" and got2.is_dir()
+        # 定稿: 主目录 2 mp4 → (2); 疑似水印不计; 已正确的保持
+        for i in range(2):
+            (got2 / f"t{i}_730000000000000000{i}.mp4").write_bytes(b"x")
+        q = got2 / "疑似水印"
+        q.mkdir()
+        (q / "w_7300000000000000009.mp4").write_bytes(b"x")
+        for i in range(3):
+            (old / f"d{i}_730000000000000001{i}.mp4").write_bytes(b"x")
+        finalize_buckets(root)
+        assert (root / "散片" / "11点20分(2)").is_dir()
+        assert (root / "散片" / "10点10分(3)").is_dir()
+        assert not (root / "散片" / "11点20分").exists()
+
+
+
+
+BUCKET_RE = re.compile(r"^(\d{2}点\d{2}分)(?:\((\d+)\))?$")
+
+
+def bucket_dir(out_dir: Path, base: str = None) -> Path:
+    """当前 10 分钟桶目录；优先认领已改名的 桶名(N) 既有目录。"""
+    base = base or hour_bucket_name()
+    root = out_dir / "散片"
+    root.mkdir(parents=True, exist_ok=True)
+    for d in sorted(root.iterdir()):
+        m = BUCKET_RE.match(d.name) if d.is_dir() else None
+        if m and m.group(1) == base:
+            return d
+    d = root / base
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def finalize_buckets(out_dir: Path) -> None:
+    """定稿：桶目录名追加合规条数 HH点MM分(N)。
+
+    N = 主目录 mp4 数（干净合规的；疑似水印子目录不计）。
+    """
+    root = out_dir / "散片"
+    if not root.is_dir():
+        return
+    for d in sorted(root.iterdir()):
+        m = BUCKET_RE.match(d.name) if d.is_dir() else None
+        if not m:
+            continue
+        n = len(list(d.glob("*.mp4")))
+        target = f"{m.group(1)}({n})"
+        if d.name == target:
+            continue
+        t = d.with_name(target)
+        if t.exists():
+            print(f"  !! 桶目录冲突跳过: {d.name} -> {target}", flush=True)
+            continue
+        try:
+            d.rename(t)
+            print(f"  ↳ 桶定稿: {target}", flush=True)
+        except Exception:
+            pass
+
 
 # ---------- 散片独立状态（与合集 auto_state.json 互不串账） ----------
 
@@ -241,8 +311,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
                 continue
             print(f"\n→ [{clean + 1}/{limit}] {title[:32] or vid}")
             # 10 分钟分桶：与"剧集"同级 → 日期/散片/HH点MM分/
-            cdir = out_dir / "散片" / hour_bucket_name()
-            cdir.mkdir(parents=True, exist_ok=True)
+            cdir = bucket_dir(out_dir)
             q = cdir / "疑似水印"
             try:
                 douyin_dl.run(f"https://www.douyin.com/video/{vid}", cdir)
@@ -284,6 +353,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
         if not progressed:
             print("!! 本轮无进展，退出（重跑同命令可再试）")
             break
+    finalize_buckets(out_dir)
     print(f"\n==== 结束 ====")
     print(f"干净散片 {clean}/{limit}｜本轮: 干净 {stat['clean']}"
           f" / 水印移走 {stat['wm']}")
