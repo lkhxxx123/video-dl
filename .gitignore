@@ -12,3 +12,8 @@ __pycache__/
 _*.png
 _*.json
 _verify_*.py
+
+# 散片独立浏览器登录态（并行模式）
+.browser-profile-clips/
+# 一次性补丁/探针脚本
+_*.py

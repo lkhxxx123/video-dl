@@ -45,6 +45,15 @@ CLIP_SEARCH_PREFIXES = ("aweme/v1/web/search/item/",
 # （首次运行要在这个窗口单独扫一次码登录）
 CLIPS_PROFILE_DIR = ds.SCRIPT_DIR / ".browser-profile-clips"
 
+# 标题垃圾过滤（用户要求: 只收故事性内容, 不要抖音日记/日常 vlog）。
+# 只匹配标题不匹配简介——故事号简介常含"日常更新"不能误伤
+JUNK_TITLE_KEYWORDS = [
+    "vlog", "Vlog", "VLOG",
+    "日常", "日记", "记录生活", "生活记录", "一天",
+    "干货", "教程", "攻略", "涨粉", "变现", "赚钱", "月入", "副业",
+    "自媒体", "运营", "剪辑教学",
+]
+
 
 # ---------- selftest ----------
 
@@ -274,6 +283,18 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
     handled = 0
     with ds.open_browser(profile_dir=CLIPS_PROFILE_DIR) as ctx:
         page = ds._first_page(ctx)
+        worker = {"page": ctx.new_page()}
+
+        def get_worker_page():
+            """兜底用页签（懒复活）：后台闲置页签会被 Chromium 丢弃
+            (Tab Discard)，用时检查 is_closed，关了就地重开。"""
+            pg = worker["page"]
+            if pg.is_closed():
+                print("  (兜底页签失效，重开)", flush=True)
+                pg = ctx.new_page()
+                worker["page"] = pg
+            return pg
+
         ds.ensure_login(ctx, page)
         stop = {"flag": False}
 
@@ -282,12 +303,12 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                 break
             print(f"\n=== 关键词 [{idx}/{len(keywords)}] {kw} ===",
                   flush=True)
-            seen_local, raw, scanned, mix_skipped = set(), 0, 0, 0
+            seen_local, raw, scanned, mix_skipped, junk = set(), 0, 0, 0, 0
             state = {"verify": False, "prompted": False}
             pending = []
 
             def on_response(resp):
-                nonlocal raw, scanned, mix_skipped
+                nonlocal raw, scanned, mix_skipped, junk
                 if not any(p in resp.url for p in CLIP_SEARCH_PREFIXES):
                     return
                 try:
@@ -309,6 +330,10 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                         # 两边不会重复下载同一视频（散片只要独立单条）
                         mix_skipped += 1
                         continue
+                    if any(k in (it.get("title") or "")
+                           for k in JUNK_TITLE_KEYWORDS):
+                        junk += 1  # 日记/日常vlog/教程类，只要故事性内容
+                        continue
                     ok, reason = ds.passes_filter(
                         it, max_followers, max_duration, max_likes,
                         min_duration)
@@ -329,7 +354,7 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                     it = pending.pop(0)
                     done_ids.add(it["aweme_id"])
                     handled += 1
-                    if process(it):
+                    if process(it, get_worker_page):
                         stop["flag"] = True
                     # 滚动定稿：时间窗已过的桶立即统计条数，不等任务结束
                     # （读 cur 引用——process 里可能已跨午夜翻过目录）
@@ -361,8 +386,34 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                 # 翻页推进以 scanned(含已下载)计——旧数据页不算"无进展",
                 # 否则二轮搜索翻不过前几页已下载内容
                 idle = 0
+                last_reload = time.time()
+                rescan = {"target": None, "steps": 0}
                 while idle < ds.MAX_IDLE_SCROLLS and not stop["flag"]:
+                    if time.time() - last_reload > ds.SEARCH_RELOAD_S:
+                        # 定期重载释放 DOM 内存；重载后快进重扫已见
+                        # 部分（seen_local 去重，不会重复处理）
+                        rescan["target"] = scanned
+                        rescan["steps"] = 0
+                        print("  (定期重载搜索页，释放 DOM 内存…)", flush=True)
+                        page.reload(timeout=30000)
+                        ds._wait_captcha(page)
+                        page.wait_for_timeout(2000)
+                        last_reload = time.time()
+                        idle = 0
+                        continue
                     before = scanned
+                    if rescan["target"] is not None:
+                        # 快进重扫：大步滚动+短等待（内容大概率已见过）
+                        rescan["steps"] += 1
+                        if scanned >= rescan["target"] or rescan["steps"] > 400:
+                            rescan["target"] = None
+                            page.mouse.wheel(0, 2000)
+                            page.wait_for_timeout(int(ds.SCROLL_WAIT * 1000))
+                        else:
+                            page.mouse.wheel(0, 8000)
+                            page.wait_for_timeout(600)
+                        drain()
+                        continue
                     page.mouse.wheel(0, 2000)
                     page.wait_for_timeout(int(ds.SCROLL_WAIT * 1000))
                     drain()  # 本屏新候选立即下载，做完再滚
@@ -371,7 +422,8 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                 page.remove_listener("response", on_response)
             print(f"  (「{kw}」扫描 {scanned} 条，已下载跳过 "
                   f"{scanned - raw} 条，合集让给jx {mix_skipped} 条，"
-                  f"散片新候选 {raw - mix_skipped} 条)", flush=True)
+                  f"日记vlog拦 {junk} 条，"
+                  f"散片新候选 {raw - mix_skipped - junk} 条)", flush=True)
             if idx < len(keywords) and not stop["flag"]:
                 time.sleep(random.uniform(3, 5))  # 词间降温
     return handled
@@ -394,8 +446,10 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
     # 可变目录引用: 跨午夜自动翻日期（通宵跑），下载/状态/分桶全跟着切
     cur = {"dir": out_dir}
 
-    def process(it) -> bool:
-        """下载+判定单条散片（发现即下）。返回 True = 已达 limit 应停搜。"""
+    def process(it, get_worker_page) -> bool:
+        """下载+判定单条散片（发现即下）。返回 True = 已达 limit 应停搜。
+
+        get_worker_page: 兜底页工厂（页签被丢弃时自动重开）。"""
         nonlocal clean
         vid, title = it["aweme_id"], it["title"]
         if vid in state["processed"]:
@@ -405,11 +459,18 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
         cdir = bucket_dir(ds.roll_date_dir(cur, on_switch=finalize_buckets))
         q = cdir / "疑似水印"
         try:
-            douyin_dl.run(f"https://www.douyin.com/video/{vid}", cdir)
+            douyin_dl.run(f"https://www.douyin.com/video/{vid}", cdir,
+                          fallback_page=get_worker_page)
         except douyin_dl.ParseError as e:
             state["processed"][vid] = {"verdict": "skip", "desc": str(e)}
             save_state(cur["dir"], state)
         except Exception as e:  # noqa: BLE001 - 失败可重试
+            if douyin_dl.is_conn_dead(e):
+                # 浏览器/driver 整体断连（崩溃或被关）——继续只会逐条
+                # 空烧，停本轮；进度按条保存，重跑同命令自动续
+                print("  !! 浏览器已断开，停止本轮（重跑同命令续传）",
+                      flush=True)
+                return True
             print(f"  下载失败（重跑续传）: {e}")
             time.sleep(2)
             return clean >= limit

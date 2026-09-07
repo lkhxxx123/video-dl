@@ -141,7 +141,15 @@ def judge_file(video: Path, api_key, base_url, model, frames_n, workdir) -> dict
     frames = wf.extract_frames(video, frames_n, workdir)
     if not frames:
         raise wf.FilterError("抽帧失败（视频损坏？）")
-    return wf.ask_vlm(frames, api_key, base_url, model)
+    try:
+        return wf.ask_vlm(frames, api_key, base_url, model)
+    finally:
+        # 判定完即清理抽帧 jpg——通宵跑几千条会无限累积占盘
+        for f in frames:
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def series_via_user_page(video_id, target_title, sec_uid, out_dir: Path,

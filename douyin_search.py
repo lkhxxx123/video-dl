@@ -31,6 +31,9 @@ LOGIN_TIMEOUT = 120
 VERIFY_WAIT = 240          # 滑块验证最长等待（实测用户可能不在屏幕前）
 SCROLL_WAIT = 1.5
 MAX_IDLE_SCROLLS = 3
+# 长跑定期重载搜索页（秒）：搜索结果卡片只增不删，DOM 无限膨胀是
+# 通宵跑浏览器内存暴涨/崩溃的主因；重载后快进重扫已见内容（seen 去重）
+SEARCH_RELOAD_S = 1500
 
 
 class SearchError(Exception):

@@ -34,6 +34,18 @@ class ParseError(Exception):
     """解析失败（链接无效 / 页面结构变更 / 触发风控等）。"""
 
 
+def is_conn_dead(e) -> bool:
+    """判定异常是否为浏览器/driver 断连（整个浏览器崩溃或被关）。
+
+    区别于单页签被关（Tab Discard，工厂可自愈）：断连后所有页面操作
+    都会失败，调用方应停止本轮而非逐条空烧。
+    """
+    s = str(e)
+    return ("Connection closed" in s
+            or "Browser has been closed" in s
+            or "Target page, context or browser has been closed" in s)
+
+
 # ---------- 链接提取 ----------
 
 SHARE_URL_RE = re.compile(
@@ -194,24 +206,39 @@ def http_get_with_retry(session, url, stream=False, headers=None):
 
 
 def download_video(session, url, dest: Path, headers=None) -> None:
-    """流式下载到 dest；任何异常/过小内容都清理半成品后再抛错。"""
-    r = http_get_with_retry(session, url, stream=True, headers=headers)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    total = 0
-    try:
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    total += len(chunk)
-    except Exception:
-        dest.unlink(missing_ok=True)  # 中途失败清半成品，避免幂等误判
-        raise
-    finally:
-        r.close()
-    if total < 1024:
-        dest.unlink(missing_ok=True)
-        raise ParseError(f"下载内容异常（仅 {total} 字节），链接可能已失效")
+    """流式下载到 dest；断流/异常/过小内容自动整档重试(RETRIES+1 次)。
+
+    实测(2026-09-05): web CDN 直链下长视频(50MB+)中途断流常见
+    (ChunkedEncodingError——GET 层的重试只覆盖建连，管不到流中途)，
+    单次尝试失败率可观，整档重试即可恢复。半成品每轮清理。
+    """
+    last_exc = None
+    for attempt in range(RETRIES + 1):
+        dest.unlink(missing_ok=True)  # 清上轮半成品，避免幂等误判
+        r = None
+        try:
+            r = http_get_with_retry(session, url, stream=True,
+                                    headers=headers)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            total = 0
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        total += len(chunk)
+            if total < 1024:
+                raise ParseError(f"下载内容异常（仅 {total} 字节），"
+                                 f"链接可能已失效")
+            return
+        except Exception as e:  # noqa: BLE001 - 断流/超时/过小统一重试
+            last_exc = e
+            if attempt < RETRIES:
+                time.sleep(1.5 * (attempt + 1))
+        finally:
+            if r is not None:
+                r.close()
+    dest.unlink(missing_ok=True)  # 最终失败也清半成品（循环顶只清下一轮）
+    raise last_exc
 
 
 # ---------- 浏览器兜底路线（分享页被风控时使用） ----------
@@ -224,12 +251,71 @@ def _capture_detail(resp, got):
             pass
 
 
-def resolve_via_browser(aweme_id: str) -> dict:
+def _resolve_detail_in_page(page, aweme_id: str) -> dict:
+    """在给定页面上打开视频页拦 detail 接口。
+
+    兜底核心——可复用流式模式的 worker 页（同进程已有 sync_playwright
+    在跑时不能再嵌套开一个，会报 "Sync API inside the asyncio loop"）。
+    结束后跳回 about:blank：视频页会自动播放，挂在后台吃内存/带宽，
+    通宵跑会累积成浏览器崩溃（实测 Connection closed 断连）。
+    """
+    got = []
+
+    def _on_resp(r):
+        _capture_detail(r, got)
+
+    try:
+        page.on("response", _on_resp)
+        page.goto(f"https://www.douyin.com/video/{aweme_id}",
+                  timeout=30000)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if got:
+                break
+            page.wait_for_timeout(1500)
+        if not got:
+            raise ParseError("浏览器兜底: 未拦截到 detail 接口"
+                             "（可能需先 --login 或触发验证）")
+        data = got[0].get("aweme_detail") or got[0]
+        urls = [u for u in ((data.get("video") or {}).get("play_addr")
+                            or {}).get("url_list") or []
+                if isinstance(u, str) and u.startswith("http")]
+        if not urls:
+            raise ParseError("浏览器兜底: detail 无 play_addr")
+        mix = (data.get("mix_info") or
+               (data.get("author") or {}).get("mix_info") or {})
+        author = data.get("author") or {}
+        return {"urls": urls,
+                "title": data.get("desc") or "",
+                "author": author.get("nickname", ""),
+                "sec_uid": author.get("sec_uid") or "",
+                "mix_id": mix.get("mix_id"),
+                "mix_name": mix.get("mix_name") or "",
+                "episode_count": mix.get("episode_count")}
+    finally:
+        # 监听器必须摘除：兜底被频繁调用时(分享页风控期)不移除会无限
+        # 叠加，每个都攥着响应数据 → 内存/CPU 复合增长 → 浏览器崩溃
+        try:
+            page.remove_listener("response", _on_resp)
+        except Exception:
+            pass
+        try:
+            page.goto("about:blank", timeout=10000)  # 卸载视频页
+        except Exception:
+            pass
+
+
+def resolve_via_browser(aweme_id: str, page=None) -> dict:
     """无头登录浏览器打开视频页，拦截 detail 接口拿无水印直链。
 
     返回 {"urls": [直链...], "title": str, "author": str}。
-    需已通过 `python douyin_search.py --login` 建立登录态。
+    page: 复用已打开页面（流式 worker 页），或返回页的工厂函数——
+    后台闲置页签会被 Chromium 丢弃(Tab Discard)，工厂在用时检查
+    is_closed 并重开；None 自开登录浏览器（需先 --login）。
     """
+    if page is not None:
+        pg = page() if callable(page) else page
+        return _resolve_detail_in_page(pg, aweme_id)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -245,46 +331,21 @@ def resolve_via_browser(aweme_id: str) -> dict:
             args=["--disable-blink-features=AutomationControlled"],
             ignore_default_args=["--enable-automation"])
         try:
-            page = context.pages[0] if context.pages else context.new_page()
-            got = []
-            page.on("response", lambda r: _capture_detail(r, got))
-            page.goto(f"https://www.douyin.com/video/{aweme_id}",
-                      timeout=30000)
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                if got:
-                    break
-                page.wait_for_timeout(1500)
-            if not got:
-                raise ParseError("浏览器兜底: 未拦截到 detail 接口"
-                                 "（可能需先 --login 或触发验证）")
-            data = got[0].get("aweme_detail") or got[0]
-            urls = [u for u in ((data.get("video") or {}).get("play_addr")
-                                or {}).get("url_list") or []
-                    if isinstance(u, str) and u.startswith("http")]
-            if not urls:
-                raise ParseError("浏览器兜底: detail 无 play_addr")
-            mix = (data.get("mix_info") or
-                   (data.get("author") or {}).get("mix_info") or {})
-            author = data.get("author") or {}
-            return {"urls": urls,
-                    "title": data.get("desc") or "",
-                    "author": author.get("nickname", ""),
-                    "sec_uid": author.get("sec_uid") or "",
-                    "mix_id": mix.get("mix_id"),
-                    "mix_name": mix.get("mix_name") or "",
-                    "episode_count": mix.get("episode_count")}
+            pg = context.pages[0] if context.pages else context.new_page()
+            return _resolve_detail_in_page(pg, aweme_id)
         finally:
             context.close()
 
 
-def _via_browser(s, aweme_id: str, out_dir: Path, name_prefix: str) -> Path:
+def _via_browser(s, aweme_id: str, out_dir: Path, name_prefix: str,
+                 page=None) -> Path:
     """浏览器兜底下载：拦 detail 接口拿 web 无水印直链再下。
 
     用于：分享页被风控拿不到数据；分享页直链失效(如 404，付费/受限内容)。
+    page: 页或页工厂（流式 worker 页），避免嵌套 sync_playwright 崩溃。
     """
     print("  (切换浏览器兜底路线…)", flush=True)
-    fb = resolve_via_browser(aweme_id)
+    fb = resolve_via_browser(aweme_id, page=page)
     dest = out_dir / (name_prefix + build_filename(fb["title"], aweme_id,
                                                     fb.get("author", "")))
     if dest.exists():
@@ -313,8 +374,14 @@ def _via_browser(s, aweme_id: str, out_dir: Path, name_prefix: str) -> Path:
 
 # ---------- 编排 ----------
 
-def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
-    """下载视频；name_prefix 用于剧集集数前缀（如 '07_'）保证排序。"""
+def run(text: str, out_dir: Path, name_prefix: str = "",
+        fallback_page=None) -> Path:
+    """下载视频；name_prefix 用于剧集集数前缀（如 '07_'）保证排序。
+
+    fallback_page: 已打开的浏览器页或页工厂（流式模式的 worker 页），
+    供兜底路线复用——避免在已运行的 sync_playwright 里嵌套再开一个
+    而崩溃；页工厂能在页签被 Chromium 丢弃时自动重开。
+    """
     url = extract_share_url(text)
     if not url:
         raise ParseError("没有识别到抖音链接，请粘贴完整分享口令")
@@ -341,7 +408,8 @@ def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
         if item is None:
             # 分享页被风控 → 浏览器兜底路线
             print("  (分享页被风控)", flush=True)
-            return _via_browser(s, aweme_id, out_dir, name_prefix)
+            return _via_browser(s, aweme_id, out_dir, name_prefix,
+                                page=fallback_page)
         info = parse_item(item)
         dest = out_dir / (name_prefix +
                           build_filename(info["title"], aweme_id,
@@ -360,7 +428,8 @@ def run(text: str, out_dir: Path, name_prefix: str = "") -> Path:
         except Exception as e:  # noqa: BLE001 - 直链失效(如404)也走兜底
             print(f"  (分享页直链失败: {type(e).__name__}，尝试浏览器兜底)",
                   flush=True)
-            return _via_browser(s, aweme_id, out_dir, name_prefix)
+            return _via_browser(s, aweme_id, out_dir, name_prefix,
+                                page=fallback_page)
     record_manifest(out_dir, dest.name, info["title"], info["author"],
                     info.get("mix_name", ""), aweme_id)
     print(f"已保存: {dest}")

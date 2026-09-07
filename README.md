@@ -21,7 +21,7 @@
 按用户手动流程：精选搜索 → 作者主页合集页 → 点进具体合集滑动拉全 → 逐集下载。
 
 ```cmd
-python run.py jx "抖音AI创作大赛,AI创作浪潮计划,未来导演扶持计划,短剧新番计划,AI漫剧,AIGC短剧,AI动漫,原创漫剧,穿越古代,重生短剧,逆袭短剧,男频短剧,女频短剧" --limit 10 --max-duration 600 --max-ep-duration 1000 --max-likes 50000 --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py jx "奇闻故事,睡前故事,神话故事,聊斋故事,历史故事,人间真实,剧情演绎,沉浸式剧情,脑洞故事,反转剧情" --limit 100 --max-duration 1000 --max-ep-duration 1500 --max-likes 50000 --frames 6 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |
@@ -47,7 +47,7 @@ python run.py jx "抖音AI创作大赛,AI创作浪潮计划,未来导演扶持�
 非剧集短视频，独立流程：root 搜索 → 按小时分桶 → 每条 3 帧验水印。
 
 ```cmd
-python run.py clips "AI 短故事 AI漫剧,AIGC短剧,AI动漫,原创漫剧,穿越古代,重生短剧,逆袭短剧,男频短剧,女频短剧" --limit 2000 --max-duration 600 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
+python run.py clips "奇闻异事,白天刷不到晚上逃不掉系列,凌哈哈故事会,灵异故事,恐怖故事,民间故事正能量,胆小慎入,都市传说,志怪故事" --limit 1000 --max-duration 1000 --max-likes 50000 --model MiniMax-M3 --base-url https://api.minimaxi.com/anthropic
 ```
 
 | 参数 | 默认 | 说明 |
