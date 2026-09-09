@@ -1,88 +1,171 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""统一启动器（仅两个模式）
+"""统一入口
 
 用法:
-  python run.py jx [参数...]              合集: 精选搜索→作者合集页→采样验水印→整部下载
-                                          不带参数 = 默认任务(见 DEFAULT_*)
-  python run.py clips "关键词" [参数...]   散片: root搜索→按小时分桶→3帧验水印
+  python run.py jx "关键词" [参数...]    合集: 精选搜索→合集页拉全→采样验水印→整部下载
+                                        不带参数 = 默认任务
+  python run.py clips "关键词" [参数...] 散片: root搜索→发现即下→10分钟分桶
+  python run.py login [--profile clips]  扫码登录（散片独立登录态需单独登录）
+  python run.py doctor                   环境自检(ffmpeg/Chromium/Key)
+  python run.py selftest                 聚合全部内置自测(不联网)
+  python run.py wm <目录> [--dry-run|--rejudge]  水印重判工具
+  python run.py dl "分享口令"            单条视频下载
 
-Key 配置(两个模式都要): key.txt 只放一行 Key 本体
-（默认百炼 qwen3.8-flash；MiniMax 见 README）
+Key 配置: key.txt 只放一行 Key 本体（任何 OpenAI 兼容服务商）
+识图默认 MiniMax-M3（Anthropic 协议端点）；换百炼加
+--model qwen3.8-flash --base-url <百炼兼容端点> 并换 key
 
-依赖库（勿删）: douyin_dl(下载引擎) douyin_search(浏览器/搜索)
-douyin_auto(状态/判定) watermark_filter(识图) series_detect(集数标记)
+架构: core(基建) + platforms(平台适配) + modes(编排) + app(服务层)
+——接新平台=新增 platforms/<name>；接 UI=换 app 的 reporter 实现。
 """
-import os
 import sys
-from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-os.chdir(SCRIPT_DIR)
+from core import bootstrap
+from core.reporting import log, urgent
 
-DEFAULT_KEYWORDS = "AI 短剧,AI 动画短片,ai漫剧,AI 微短剧,原创AI短剧"
-DEFAULT_SEARCH_ARGS = ["--limit", "5", "--max-likes", "500000"]
+bootstrap.setup_stdio()
+bootstrap.chdir_app_root()
+bootstrap.setup_runtime_env()
 
-
-def load_key() -> bool:
-    """key.txt 第一行有效 Key → 注入环境变量。已有环境变量则直接用。
-
-    key.txt 只放 key 本体（一行，不带备注）；不要求 sk- 开头——
-    不同 OpenAI 兼容服务商的 key 前缀不同。
-    识别规则：纯 ASCII、无空白、≥8 字符（天然排除中文备注/占位行）。
-    """
-    if os.environ.get("DASHSCOPE_API_KEY"):
-        return True
-    kf = SCRIPT_DIR / "key.txt"
-    if kf.exists():
-        for line in kf.read_text(encoding="utf-8").splitlines():
-            k = line.strip()
-            if (k and k.isascii() and " " not in k and "\t" not in k
-                    and "在这里" not in k and len(k) >= 8):
-                os.environ["DASHSCOPE_API_KEY"] = k
-                return True
-    return False
+_PLATFORMS_HOME = "https://www.douyin.com/"
 
 
-def need_key(rest):
-    if "--selftest" in rest:
-        return True
-    if not load_key():
-        print("错误: 未找到 Key —— 用记事本打开 key.txt，把 Key 本体"
-              "粘成一行（纯 Key，不带备注）", file=sys.stderr)
-        sys.exit(1)
+def _no_key_guard(rest) -> bool:
+    """selftest/doctor/help 不需要 Key；jx/clips/wm/dl 需要（modes 内查）。"""
+    return True
+
+
+def cmd_login(rest):
+    import argparse
+    from core.browser import login_only
+    from core.paths import CLIPS_PROFILE_DIR
+    p = argparse.ArgumentParser(prog="run.py login")
+    p.add_argument("--profile", choices=["main", "clips"], default="main",
+                   help="clips=散片独立登录态(首次需单独扫码)")
+    a = p.parse_args(rest)
+    profile = CLIPS_PROFILE_DIR if a.profile == "clips" else None
+    login_only(_PLATFORMS_HOME, profile_dir=profile)
+
+
+def cmd_doctor(rest):
+    """环境自检：ffmpeg/ffprobe 可用 → Chromium 可启动 → Key 已配置。"""
+    import subprocess
+    from core import paths
+    from core.reporting import log, urgent
+    ok = True
+
+    log("== 视频下载器环境自检 ==")
+    # 1) ffmpeg / ffprobe
+    for tool in ("ffmpeg", "ffprobe"):
+        path = paths.find_tool(tool)
+        try:
+            r = subprocess.run([path, "-version"], capture_output=True,
+                               text=True, timeout=30)
+            ver = (r.stdout or "").splitlines()[0][:60] if r.returncode == 0 \
+                else "(无法执行)"
+            ok &= r.returncode == 0
+            log(f"  {'✓' if r.returncode == 0 else '✗'} {tool}: {ver}"
+                f"  [{path}]")
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            log(f"  ✗ {tool}: {e}", err=True)
+    # 2) Chromium
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            b.close()
+        log("  ✓ Chromium: 可启动")
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        log(f"  ✗ Chromium: {e}", err=True)
+        urgent("    → 执行: playwright install chromium")
+    # 3) Key
+    from app.service import load_key
+    if load_key():
+        log("  ✓ API Key: 已配置(key.txt/环境变量)")
+    else:
+        ok = False
+        log("  ✗ API Key: 未找到 —— key.txt 里粘一行 Key 本体", err=True)
+    log(f"== {'环境正常' if ok else '存在问题，见上方 ✗ 项'} ==")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_selftest(rest):
+    """聚合全部模块内置自测（不联网、不开浏览器）；任一 FAIL 退出码 1。"""
+    from core import naming, state, browser, filter as filter_mod, watermark
+    from platforms.douyin import dl, search, series
+    from modes import auto, jx, clips
+    modules = [naming, state, browser, filter_mod, watermark,
+               dl, search, series, auto, jx, clips]
+    ok = True
+    for m in modules:
+        log(f"[{m.__name__}]")
+        ok = m.run_selftests() and ok
+    log(f"\n总计: {'全部通过 ✓' if ok else '存在 FAIL ✗'}")
+    sys.exit(0 if ok else 1)
 
 
 def main():
-    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
     args = sys.argv[1:]
-    mode = args[0] if args else "jx"
+    mode = args[0] if args else None
+    if mode is None:
+        # 无参数: exe 双击 → 图形界面; 开发态保持旧行为(默认合集任务)
+        mode = "ui" if getattr(sys, "frozen", False) else "jx"
     rest = args[1:]
     if mode in ("-h", "--help", "help"):
         print(__doc__)
         return
     if mode in ("jx", "jingxuan"):
-        import douyin_jx
-        if not rest:
-            rest = [DEFAULT_KEYWORDS] + DEFAULT_SEARCH_ARGS
-        need_key(rest)
-        douyin_jx.main(rest)
+        from modes import jx
+        jx.main(rest)
         return
     if mode in ("clips", "sp"):
-        import douyin_clips
-        if not rest:
-            print('用法: python run.py clips "关键词" [参数…]',
-                  file=sys.stderr)
-            sys.exit(1)
-        need_key(rest)
-        douyin_clips.main(rest)
+        from modes import clips
+        clips.main(rest)
         return
-    print(f"未知模式: {mode}（仅支持 jx / clips）\n{__doc__}",
-          file=sys.stderr)
+    if mode == "login":
+        cmd_login(rest)
+        return
+    if mode == "doctor":
+        cmd_doctor(rest)
+        return
+    if mode == "selftest":
+        cmd_selftest(rest)
+        return
+    if mode == "wm":
+        from core import watermark
+        watermark.main(rest)
+        return
+    if mode == "dl":
+        from platforms.douyin import dl
+        dl.main(rest)
+        return
+    if mode in ("ui", "gui"):
+        from app.ui import gui
+        gui.show()
+        return
+    print(f"未知模式: {mode}（支持 jx/clips/ui/login/doctor/selftest/wm/dl）\n"
+          f"{__doc__}", file=sys.stderr)
     sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001 - 顶层兜底: 落日志+弹窗(无控制台也能看到)
+        import traceback
+        err = traceback.format_exc()
+        try:
+            log(err, err=True)
+        except Exception:  # noqa: BLE001
+            pass
+        if getattr(sys, "frozen", False):
+            import ctypes
+            tail = err.strip().splitlines()[-1] if err.strip() else "未知错误"
+            ctypes.windll.user32.MessageBoxW(
+                0, f"启动出错:\n{tail}\n\n详情见 logs\\运行日志.txt",
+                "视频下载器", 0x10)

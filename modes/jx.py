@@ -24,33 +24,21 @@ import sys
 import time
 from pathlib import Path
 
-import douyin_auto
-import douyin_dl
-import douyin_search as ds
-import watermark_filter as wf
+import core.selftest
+from core.reporting import checkpoint, event, log, urgent
+import core.watermark as wf
+from core import paths
+from core.browser import is_conn_dead
+from modes import auto as douyin_auto
+from platforms.douyin import dl as douyin_dl
+from platforms.douyin import search as ds
+from platforms.douyin.series import looks_continuous
 
 
 # ---------- selftest ----------
 
-def _collect_selftests():
-    return sorted(
-        (name, fn) for name, fn in globals().items()
-        if name.startswith("test_") and callable(fn)
-    )
-
-
 def run_selftests():
-    tests = _collect_selftests()
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(f"  FAIL {name}: {type(e).__name__}: {e}")
-    print(f"selftest: {len(tests) - failed}/{len(tests)} 项通过")
-    return failed == 0
+    return core.selftest.run_selftests(globals())
 
 
 # ---------- 纯逻辑 ----------
@@ -250,8 +238,8 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
     """
     if page is None:
         with ds.open_browser() as ctx:
-            p = ds._first_page(ctx)
-            ds.ensure_login(ctx, p)
+            p = ds.first_page(ctx)
+            ds.ensure_login(ctx, p, ds.DOUYIN_HOME)
             return collect_collection(entry_video_id, sec_uid, mix_id,
                                       mix_name, early_stop, fast, page=p)
 
@@ -285,26 +273,26 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
             return
         if fresh:
             items.extend(fresh)
-            print(f"  (+{len(fresh)} 集, 累计 {len(items)})", flush=True)
+            log(f"  (+{len(fresh)} 集, 累计 {len(items)})", flush=True)
 
     page.on("response", on_response)
     try:
         # ② 作者主页（等效：视频页右上角作者名 → 主页）
         page.goto(f"https://www.douyin.com/user/{sec_uid}",
                   timeout=30000)
-        ds._wait_captcha(page)
+        ds.wait_captcha(page)
         page.wait_for_timeout(2000)
         # ③ 切换到"合集"页
         try:
             page.get_by_text("合集", exact=True).first.click(
                 timeout=5000)
-            print("  (已切换到合集页)", flush=True)
+            log("  (已切换到合集页)", flush=True)
         except Exception:
             page.goto(f"https://www.douyin.com/user/{sec_uid}"
                       "?showSubTab=compilation&showTab=post",
                       timeout=30000)
-            ds._wait_captcha(page)
-            print("  (直达合集页)", flush=True)
+            ds.wait_captcha(page)
+            log("  (直达合集页)", flush=True)
         page.wait_for_timeout(2500)
         # ③' 点进具体合集（卡片带权威"更新至N集"）
         clicked = None
@@ -317,13 +305,13 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
             if not clicked:
                 page.wait_for_timeout(1500)
         if clicked:
-            print(f"  (已进入合集: {clicked[:50]})", flush=True)
+            log(f"  (已进入合集: {clicked[:50]})", flush=True)
             m = re.search(r"更新至\s*(\d+)\s*集", clicked)
             if m:
                 state["total"] = int(m.group(1))
-                print(f"  (该合集共 {state['total']} 集)", flush=True)
+                log(f"  (该合集共 {state['total']} 集)", flush=True)
         else:
-            print("  (未找到合集卡片，收集页面现有内容)", flush=True)
+            log("  (未找到合集卡片，收集页面现有内容)", flush=True)
         # fast=True 冲刺翻页(只要尾部, 等待砍到1/3): 稳2500→800,
         # 每轮1800→500, idle 20→10
         settle_ms = 800 if fast else 2500
@@ -334,13 +322,14 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
         try:
             page.get_by_text("展开", exact=True).first.click(
                 timeout=4000)
-            print("  (已展开集数列表)", flush=True)
+            log("  (已展开集数列表)", flush=True)
             page.wait_for_timeout(2000)
         except Exception:
             pass
         # 等首批剧集响应
         deadline = time.time() + 20
         while time.time() < deadline and not items:
+            checkpoint()
             page.wait_for_timeout(1500)
         # ③'' 持续滑动加载当前合集所有剧集
         stopped_early = False
@@ -348,9 +337,10 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
         while idle < max_idle:
             if state["total"] and len(items) >= state["total"]:
                 break
+            checkpoint()
             if early_stop >= 2 and len(items) >= early_stop:
                 stopped_early = True
-                print(f"  (已集齐采样所需 {len(items)} 集，提前返回)",
+                log(f"  (已集齐采样所需 {len(items)} 集，提前返回)",
                       flush=True)
                 break
             before = len(items)
@@ -372,7 +362,7 @@ def collect_collection(entry_video_id, sec_uid, mix_id="", mix_name="",
     if not items:
         raise ds.SearchError("未拦截到合集剧集接口（可能触发验证）")
     if state["total"] and len(items) < state["total"]:
-        print(f"  ⚠ 只拿到 {len(items)}/{state['total']} 集（滑动未翻完）",
+        log(f"  ⚠ 只拿到 {len(items)}/{state['total']} 集（滑动未翻完）",
               flush=True)
     return ds.sort_episodes(items), not stopped_early
 
@@ -392,7 +382,7 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
     max_followers, max_duration, max_likes = filters
     handled = 0
     with ds.open_browser() as ctx:
-        search_page = ds._first_page(ctx)
+        search_page = ds.first_page(ctx)
         worker = {"page": ctx.new_page()}
 
         def get_worker_page():
@@ -400,18 +390,18 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
             Chromium 丢弃(Tab Discard)，用时检查 is_closed，关了重开。"""
             pg = worker["page"]
             if pg.is_closed():
-                print("  (worker 页签失效，重开)", flush=True)
+                log("  (worker 页签失效，重开)", flush=True)
                 pg = ctx.new_page()
                 worker["page"] = pg
             return pg
 
-        ds.ensure_login(ctx, search_page)
+        ds.ensure_login(ctx, search_page, ds.DOUYIN_HOME)
         stop = {"flag": False}
 
         for idx, kw in enumerate(keywords, 1):
             if stop["flag"]:
                 break
-            print(f"\n=== 精选搜索 关键词 [{idx}/{len(keywords)}] {kw} ===",
+            log(f"\n=== 精选搜索 关键词 [{idx}/{len(keywords)}] {kw} ===",
                   flush=True)
             seen_local, raw, scanned, no_mix = set(), 0, 0, 0
             state = {"verify": False, "prompted": False}
@@ -450,7 +440,7 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
                             continue
                         pending.append(it)
                     else:
-                        print(f"  跳过: "
+                        log(f"  跳过: "
                               f"{(it['title'] or it['aweme_id'])[:24]}"
                               f"（{reason}）", flush=True)
 
@@ -465,10 +455,10 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
                         if process_series(it, get_worker_page):
                             stop["flag"] = True
                     except Exception as e:  # noqa: BLE001
-                        if douyin_dl.is_conn_dead(e):
+                        if is_conn_dead(e):
                             # 浏览器/driver 整体断连——停本轮不空烧，
                             # 进度已保存，重跑同命令续传
-                            print("  !! 浏览器已断开，停止本轮"
+                            log("  !! 浏览器已断开，停止本轮"
                                   "（重跑同命令续传）", flush=True)
                             stop["flag"] = True
                         else:
@@ -478,21 +468,20 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
             try:
                 for url in ds._search_urls(kw, prefer_jingxuan=True):
                     search_page.goto(url, timeout=30000)
-                    ds._wait_captcha(search_page)
+                    ds.wait_captcha(search_page)
                     probe = time.time() + 12
                     while time.time() < probe and scanned == 0:
                         search_page.wait_for_timeout(1500)
                     if scanned:
-                        print(f"  (路由命中: {url.split('/')[3]})", flush=True)
+                        log(f"  (路由命中: {url.split('/')[3]})", flush=True)
                         break
-                    print(f"  (路由 {url.split('/')[3]} 无数据，切换…)",
+                    log(f"  (路由 {url.split('/')[3]} 无数据，切换…)",
                           flush=True)
                 # 长等待滑块
                 deadline = time.time() + ds.VERIFY_WAIT
                 while scanned == 0 and time.time() < deadline:
                     if state["verify"] and not state["prompted"]:
-                        print(">>> 触发滑块验证：请在浏览器窗口中拖动完成拼图"
-                              " <<<", flush=True)
+                        urgent(">>> 触发滑块验证：请在浏览器窗口中拖动完成拼图 <<<")
                         state["prompted"] = True
                     search_page.wait_for_timeout(1500)
                 drain()  # 首屏合格候选立即开始处理
@@ -506,9 +495,9 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
                         # 部分（seen_local 去重，不会重复处理）
                         rescan["target"] = scanned
                         rescan["steps"] = 0
-                        print("  (定期重载搜索页，释放 DOM 内存…)", flush=True)
+                        log("  (定期重载搜索页，释放 DOM 内存…)", flush=True)
                         search_page.reload(timeout=30000)
-                        ds._wait_captcha(search_page)
+                        ds.wait_captcha(search_page)
                         search_page.wait_for_timeout(2000)
                         last_reload = time.time()
                         idle = 0
@@ -533,7 +522,7 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
                     idle = 0 if scanned > before else idle + 1
             finally:
                 search_page.remove_listener("response", on_response)
-            print(f"  (「{kw}」扫描 {scanned} 条，已下载跳过 "
+            log(f"  (「{kw}」扫描 {scanned} 条，已下载跳过 "
                   f"{scanned - raw - no_mix} 条，散片让给clips {no_mix} 条，"
                   f"合集候选 {raw} 条)", flush=True)
             if idx < len(keywords) and not stop["flag"]:
@@ -546,11 +535,11 @@ def collect_series_stream(keywords, filters, block_keywords, done_ids,
 
 def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         base_url, model, out_dir: Path, sample=2, max_ep_duration=600,
-        min_duration=30):
+        min_episodes=0, min_duration=30):
     state = douyin_auto.load_state(out_dir)
     douyin_auto.reconcile_state(out_dir, state)
     # 项目级弃剧名单(跨天): 有水印弃用的合集直接跳过, 不再重复采样
-    skip_path = ds.SCRIPT_DIR / "watermark_skip.json"
+    skip_path = paths.SKIP_LIST_PATH
     skip_list = {}
     if skip_path.exists():
         try:
@@ -559,12 +548,12 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             skip_list = {}
     done_ids = (set(state["processed"])
                 | ds.existing_ids_under(ds.DOWNLOADS_DIR))
-    print(f"起点: 已处理 {len(done_ids)} 条")
+    log(f"起点: 已处理 {len(done_ids)} 条")
 
     # 可变目录引用: 跨午夜翻日期（通宵跑），每部剧开始前检查——
     # 粒度=整部剧，绝不在一部剧中途切目录
     cur = {"dir": out_dir}
-    stat = {"clean": 0, "wm": 0, "skip_done": 0, "nojudge": 0}
+    stat = {"clean": 0, "wm": 0, "skip_done": 0}
     n_new = 0
 
     def process_series(it, get_worker_page) -> bool:
@@ -575,14 +564,14 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         nonlocal n_new
         mid_str = str(it.get("mix_id") or "")
         name = it.get("mix_name") or (it["title"][:20] or "未命名剧集")
-        print(f"\n=== 剧集 {name[:24]} ===")
+        log(f"\n=== 剧集 {name[:24]} ===")
         if it.get("sec_uid"):
-            print(f"作者: {it.get('nick') or '?'}  "
+            log(f"作者: {it.get('nick') or '?'}  "
                   f"主页: https://www.douyin.com/user/{it['sec_uid']}")
-        print(f"入口视频: {it['aweme_id']}")
+        log(f"入口视频: {it['aweme_id']}")
         if mid_str in skip_list:
             rec = skip_list[mid_str]
-            print(f"  ↳ 已弃剧记录（{rec.get('date', '?')} "
+            log(f"  ↳ 已弃剧记录（{rec.get('date', '?')} "
                   f"{rec.get('reason', '')}），直接跳过")
             done_ids.add(it["aweme_id"])
             stat["skip_done"] += 1
@@ -608,7 +597,7 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     if count:
                         tag += f"({count}集)"
                     sdir.rename(sdir.with_name(tag))
-                    print(f"  ↳ 目录已标记: {tag}", flush=True)
+                    log(f"  ↳ 目录已标记: {tag}", flush=True)
             except Exception:
                 pass
 
@@ -634,19 +623,20 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 douyin_auto.save_state(cur["dir"], state)
                 return "skip"
             except Exception as e:  # noqa: BLE001 - 单集失败不中断
-                if douyin_dl.is_conn_dead(e):
+                if is_conn_dead(e):
                     raise  # 浏览器整体断连 → 交给 drain 层停轮
-                print(f"  {prefix}下载失败（重跑续传）: {e}")
+                log(f"  {prefix}下载失败（重跑续传）: {e}")
                 time.sleep(2)
                 return "error"
             f = douyin_auto.find_by_id(sdir, evid)
             if not f:
                 return "error"
             try:
-                v = douyin_auto.judge_file(f, api_key, base_url, model,
-                                           frames_n, sdir / ".wm_frames")
+                v = wf.judge_file(f, api_key, base_url, model,
+                                  frames_n, sdir / ".wm_frames",
+                                  author=it.get("nick") or "")
             except Exception as e:  # noqa: BLE001 - 识图失败保留重判
-                print(f"  {prefix}识图失败（保留，重跑重判）: {e}")
+                log(f"  {prefix}识图失败（保留，重跑重判）: {e}")
                 return "error"
             if v.get("has_author_watermark"):
                 q.mkdir(exist_ok=True)
@@ -654,38 +644,17 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 state["processed"][evid] = {
                     "verdict": "watermarked",
                     "desc": v.get("desc", "")[:60]}
-                print(f"  ⚠ {prefix}有作者水印 → 移走")
+                log(f"  ⚠ {prefix}有作者水印 → 移走")
                 stat["wm"] += 1
             else:
                 state["processed"][evid] = {"verdict": "clean"}
-                print(f"  ✓ {prefix}干净")
+                log(f"  ✓ {prefix}干净")
                 stat["clean"] += 1
             douyin_auto.save_state(cur["dir"], state)
             time.sleep(random.uniform(1, 2))
             return "watermarked" if v.get("has_author_watermark") else "clean"
 
-        def download_only(ep, j):
-            """首尾采样通过后：只下载不判定（省识图调用）。"""
-            evid = ep["aweme_id"]
-            done_ids.add(evid)
-            prefix = ds.episode_prefix(ep.get("ep") or j, len(eps))
-            try:
-                douyin_dl.run(f"https://www.douyin.com/video/{evid}",
-                              sdir, name_prefix=prefix,
-                              fallback_page=get_worker_page)
-            except Exception as e:  # noqa: BLE001
-                if douyin_dl.is_conn_dead(e):
-                    raise  # 浏览器整体断连 → 交给 drain 层停轮
-                print(f"  {prefix}下载失败（重跑续传）: {e}")
-                time.sleep(2)
-                return
-            state["processed"][evid] = {
-                "verdict": "nojudge",
-                "desc": "首尾采样均无水印，跳过判定"}
-            douyin_auto.save_state(cur["dir"], state)
-            print(f"  ↓ {prefix}已下载（未判定）")
-            stat["nojudge"] += 1
-            time.sleep(random.uniform(1, 2))
+        # (download_only 已删除: 中间集免判盲区实测漏检, 全集判定)
 
         # 采样提速①：集合一够采样量就提前返回，先下前几集验水印；
         # 全有水印 → 弃剧（全集没滑完、其余没下载，最快路径）
@@ -697,12 +666,14 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                 early_stop=early, page=get_worker_page())
         except ds.SearchError as e:
             if "入口视频需付费" in str(e):
-                print(f"  ⚑ 入口视频需付费 → 弃剧", flush=True)
+                log(f"  ⚑ 入口视频需付费 → 弃剧", flush=True)
                 record_abandon("入口视频需付费")
                 stat["abandoned"] = stat.get("abandoned", 0) + 1
-                print("  ⚑ 本部完成（付费跳过，不占 limit 配额）")
+                log("  ⚑ 本部完成（付费跳过，不占 limit 配额）")
+                event({"type": "progress", "done": n_new, "total": limit,
+                       "unit": "部", "now": "付费合集跳过"})
             else:
-                print(f"  !! 拉合集失败: {e}")
+                log(f"  !! 拉合集失败: {e}")
             return n_new >= limit
         if not complete and len(eps) >= 2:
             head = ds.sort_episodes(eps)[:sample]
@@ -712,14 +683,16 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                       if v in ("clean", "watermarked")]
             # 前几集任一有水印 → 开头就挂印，后面逻辑全不走（用户规则）
             if any(v == "watermarked" for v in judged):
-                print(f"  ⚑ 前{len(judged)}集采样即有水印"
+                log(f"  ⚑ 前{len(judged)}集采样即有水印"
                       f"（{sum(1 for v in judged if v == 'watermarked')}"
                       f"/{len(judged)}）→ 弃剧（后续逻辑全跳过）", flush=True)
                 record_abandon("前几集采样即有水印")
                 stat["abandoned"] = stat.get("abandoned", 0) + 1
-                print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
+                log("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
+                event({"type": "progress", "done": n_new, "total": limit,
+                       "unit": "部", "now": "采样弃剧"})
                 return n_new >= limit
-            print("  (采样通过 → 冲刺翻页拉取全剧集目录（只取列表不下载）…)",
+            log("  (采样通过 → 冲刺翻页拉取全剧集目录（只取列表不下载）…)",
                   flush=True)
             try:
                 eps, complete = collect_collection(
@@ -727,12 +700,12 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                     mix_id=str(it.get("mix_id") or ""), mix_name=name,
                     fast=True, page=get_worker_page())
             except ds.SearchError as e:
-                print(f"  !! 拉全集失败: {e}")
+                log(f"  !! 拉全集失败: {e}")
                 return n_new >= limit
         # 滑动偶发不全：拿到的全已下载且数量偏少 → 重拉一次
         if (eps and len(eps) < 8
                 and all(ep["aweme_id"] in done_ids for ep in eps)):
-            print("  ↳ 疑似滑动不全，重拉一次…", flush=True)
+            log("  ↳ 疑似滑动不全，重拉一次…", flush=True)
             try:
                 eps2, _ = collect_collection(
                     it["aweme_id"], it.get("sec_uid") or "",
@@ -745,34 +718,43 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
         # 合并总集拦截（全集列表到手后、采样下载前——最快拦截点）
         comp, n_long, m = is_compilation(eps, max_ep_duration)
         if comp:
-            print(f"  ⚑ 合并总集类合集（{n_long}/{m} 集超 "
-                  f"{max_ep_duration // 60} 分钟）→ 弃剧", flush=True)
+            log(f"  ⚑ 合并总集类合集（{n_long}/{m} 集超 "
+                f"{max_ep_duration // 60} 分钟）→ 弃剧", flush=True)
             record_abandon(f"合并总集({n_long}/{m}集超{max_ep_duration}s)")
             stat["abandoned"] = stat.get("abandoned", 0) + 1
-            print("  ⚑ 本部完成（合并总集弃剧，不占 limit 配额）")
+            event({"type": "progress", "done": n_new, "total": limit,
+                   "unit": "部", "now": "合并总集弃剧"})
+            log("  ⚑ 本部完成（合并总集弃剧，不占 limit 配额）")
+            return n_new >= limit
+        # 总集数下限（数量少的合集不要，不占配额；记弃剧名单防重跑空转）
+        if min_episodes and len(eps) < min_episodes:
+            log(f"  ⚑ 总集数 {len(eps)} < {min_episodes} → 跳过（数量少）",
+                flush=True)
+            record_abandon(f"总集数不足({len(eps)}<{min_episodes})",
+                           count=len(eps))
+            stat["abandoned"] = stat.get("abandoned", 0) + 1
+            event({"type": "progress", "done": n_new, "total": limit,
+                   "unit": "部", "now": f"总集数不足跳过({len(eps)}集)"})
             return n_new >= limit
         if len(eps) < 2:
-            print("  ↳ 只拿到 1 集（非完整剧集），跳过")
+            log("  ↳ 只拿到 1 集（非完整剧集），跳过")
             return n_new >= limit
-        cont, why = ds.looks_continuous(eps)
-        print(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
+        cont, why = looks_continuous(eps)
+        log(f"  连续性: {'✓ ' + why if cont else '△ 标题不规整（' + why + '），仍按合集下载'}")
         if all(ep["aweme_id"] in done_ids for ep in eps):
-            print(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
+            log(f"  ↳ 全部 {len(eps)} 集已下载过，跳过（不占配额）")
             done_ids.add(it["aweme_id"])  # 入口非分集(导流片), 排除重翻
             stat["skip_done"] += 1
             return n_new >= limit
-        print(f"  共 {len(eps)} 集 → {sdir}")
-        # 采样提速③：首2集已判过 → 此处直接下载最后2集判定；
-        # 均无水印 → 中间集只下载不判定（首集抓"从头有水印"，
-        # 尾集抓"中途才加水印"——作者涨粉后加印常见）
-        # 门槛从 >2*sample 放宽到 >=2：4集小合集首尾采样即全集，
-        # 任何一集有水印同样弃用（实测漏网：3部4集合集各1集水印未标记）
-        skip_judge = False
+        log(f"  共 {len(eps)} 集 → {sdir}")
+        # 采样提速③(2026-09-08 修订)：首2+尾2【优先判定】快速弃剧；
+        # 中间集不再免判——nojudge 盲区实测漏检(每集都有水印的剧
+        # 首尾恰好干净, 如 AI视频素材: 思政小管家水印集) → 全集判定
         if (sample or 0) >= 2 and len(eps) >= 2:
             tail_pending = [ep for ep in eps[-sample:]
                             if ep["aweme_id"] not in done_ids]
             if tail_pending:
-                print(f"  → 直接下载最后 {len(tail_pending)} 集采样判定…",
+                log(f"  → 直接下载最后 {len(tail_pending)} 集采样判定…",
                       flush=True)
             positions = (list(enumerate(eps[:sample], 1))
                          + list(enumerate(eps[-sample:],
@@ -791,39 +773,35 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
             # 统一规则：采样4集中任一有水印 → 弃剧（无慢路径）
             if any(v == "watermarked" for v in eff):
                 wm_n = sum(1 for v in eff if v == "watermarked")
-                print(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
+                log(f"  ⚑ 采样{len(eff)}集中{wm_n}集有水印 → 弃剧",
                       flush=True)
                 record_abandon(f"采样{wm_n}/{len(eff)}集有水印",
                                count=len(eps))
                 stat["abandoned"] = stat.get("abandoned", 0) + 1
-                print("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
+                log("  ⚑ 本部完成（采样弃剧，不占 limit 配额）")
+                event({"type": "progress", "done": n_new, "total": limit,
+                       "unit": "部", "now": "采样弃剧"})
                 return n_new >= limit
-            # 全净才免判中间；且要求至少 2*sample-1 集有效判定
-            # （防识图失败被当成通过）
-            if (len(eff) >= min(len(eps), 2 * sample - 1)
-                    and all(v == "clean" for v in eff)):
-                skip_judge = True
-                mid = max(len(eps) - 2 * sample, 0)
-                print(f"  ⚑ 采样{len(eff)}集均无水印 → 其余 {mid} 集"
-                      f"只下载不判定", flush=True)
+            # (2026-09-08 修订) 采样集均无水印后, 中间集【不再免判】——
+            # nojudge 盲区实测漏检: 每集都有水印的剧(思政小管家水印集)
+            # 首尾恰好干净, 中间集水印完全检测不到 → 全集判定
         for j, ep in enumerate(eps, 1):
             if ep["aweme_id"] in done_ids:
                 continue
-            if skip_judge:
-                download_only(ep, j)
-            else:
-                fetch_and_judge(ep, j, len(eps))
+            fetch_and_judge(ep, j, len(eps))
         # 成功保留: 目录名加集数（幂等，已带括号则跳过；小时在桶目录上）
         try:
             target = f"{base}({len(eps)}集)"
             if (sdir.is_dir() and sdir.name != target
                     and not sdir.name.startswith("有水印弃用-")):
                 sdir.rename(sdir.with_name(target))
-                print(f"  ↳ 目录改名: {target}", flush=True)
+                log(f"  ↳ 目录改名: {target}", flush=True)
         except Exception:
             pass
         n_new += 1
-        print("  ⚑ 本部完成")
+        log("  ⚑ 本部完成")
+        event({"type": "progress", "done": n_new, "total": limit,
+               "unit": "部", "now": f"已保留 {n_new}/{limit} 部"})
         return n_new >= limit
 
     # 流式: 搜索发现一部 → 立刻下载处理 → 做完再继续滚动翻页
@@ -831,12 +809,12 @@ def run(keywords, limit, filters, block_keywords, frames_n, api_key,
                                     done_ids, process_series,
                                     min_duration=min_duration)
     if not handled:
-        print("!! 没有新候选（关键词翻尽或全被筛选/去重排除）")
-    print(f"\n==== 结束 ====")
-    print(f"成功保留 {n_new} 部 / 弃用 {stat.get('abandoned', 0)} 部"
+        log("!! 没有新候选（关键词翻尽或全被筛选/去重排除）")
+    event({"type": "done", "done": n_new, "total": limit})
+    log(f"\n==== 结束 ====")
+    log(f"成功保留 {n_new} 部 / 弃用 {stat.get('abandoned', 0)} 部"
           f" / 已完整跳过 {stat['skip_done']} 部"
-          f"｜分集: 干净 {stat['clean']} / 水印移走 {stat['wm']}"
-          f" / 未判定 {stat['nojudge']}")
+          f"｜分集: 干净 {stat['clean']} / 水印移走 {stat['wm']}")
 
 
 
@@ -861,6 +839,9 @@ def main(argv=None):
     parser.add_argument("--sample", type=int, default=2,
                         help="采样提速: 先下前N集验水印, 全有水印则跳过整部"
                              " (默认2, 0=关闭逐集判定)")
+    parser.add_argument("--min-episodes", type=int, default=0,
+                        help="总集数下限: 合集总集数小于该值则跳过"
+                             " (0=不限)")
     parser.add_argument("--model", default=wf.DEFAULT_MODEL)
     parser.add_argument("--base-url", default=wf.DEFAULT_BASE_URL)
     parser.add_argument("--selftest", action="store_true",
@@ -872,15 +853,15 @@ def main(argv=None):
     if not args.keyword:
         parser.error("请提供搜索关键词")
     if not api_key:
-        print("错误: 未设置 DASHSCOPE_API_KEY（key.txt 或环境变量）",
+        log("错误: 未设置 DASHSCOPE_API_KEY（key.txt 或环境变量）",
               file=sys.stderr)
         sys.exit(1)
     keywords = ds.split_keywords(args.keyword)
     out_dir = ds.make_dated_dir(ds.DOWNLOADS_DIR)
-    print(f"输出目录: {out_dir}")
+    log(f"输出目录: {out_dir}")
     filters = (args.max_followers, args.max_duration, args.max_likes)
     if any(v is not None for v in filters):
-        print(f"筛选: 粉丝<{args.max_followers or '∞'} "
+        log(f"筛选: 粉丝<{args.max_followers or '∞'} "
               f"时长<{args.max_duration or '∞'}s 赞<{args.max_likes or '∞'}")
     if args.block_keywords is None:
         block_kw = ds.DEFAULT_BLOCK_KEYWORDS
@@ -890,9 +871,10 @@ def main(argv=None):
         run(keywords, args.limit, filters, block_kw, args.frames, api_key,
             args.base_url, args.model, out_dir, sample=args.sample,
             max_ep_duration=args.max_ep_duration or None,
+            min_episodes=args.min_episodes or 0,
             min_duration=args.min_duration or None)
     except KeyboardInterrupt:
-        print("\n中断（进度已保存，重跑同命令自动续）")
+        log("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)
 
 

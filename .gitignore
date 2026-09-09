@@ -1,5 +1,6 @@
 # 敏感：API Key 与浏览器登录态，绝不入库
 key.txt
+config.json
 .browser-profile/
 
 # 运行产物
@@ -15,5 +16,20 @@ _verify_*.py
 
 # 散片独立浏览器登录态（并行模式）
 .browser-profile-clips/
+# 打包运行时(ffmpeg/Chromium 大文件, 由 build 脚本放置)
+runtime/
+# 构建产物(PyInstaller)
+dist/
+build/
+# 无控制台模式的运行日志
+logs/
 # 一次性补丁/探针脚本
 _*.py
+
+# 调试抽帧图片
+ai3_*.jpg
+ep2_*.jpg
+chk_*.jpg
+
+# 设计文档不入库(仅本地)
+docs/

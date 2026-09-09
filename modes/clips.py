@@ -18,7 +18,6 @@
 仅限个人离线保存；请尊重创作者版权，勿二次上传。
 """
 import argparse
-import json
 import os
 import random
 import re
@@ -28,10 +27,15 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-import douyin_auto
-import douyin_dl
-import douyin_search as ds
-import watermark_filter as wf
+import core.selftest
+from core.reporting import checkpoint, event, log, urgent
+import core.watermark as wf
+from core import paths
+from core import state as cs
+from core.browser import is_conn_dead
+from modes import auto as douyin_auto
+from platforms.douyin import dl as douyin_dl
+from platforms.douyin import search as ds
 
 FRAMES = 3  # 用户指定：散片只抽 3 帧
 
@@ -43,7 +47,8 @@ CLIP_SEARCH_PREFIXES = ("aweme/v1/web/search/item/",
 # 独立浏览器 profile：与合集(jx)共用 .browser-profile 会抢 Chromium 的
 # profile 锁，并行跑时后开的一方起不来；散片用自己的目录
 # （首次运行要在这个窗口单独扫一次码登录）
-CLIPS_PROFILE_DIR = ds.SCRIPT_DIR / ".browser-profile-clips"
+CLIPS_PROFILE_DIR = paths.CLIPS_PROFILE_DIR  # CLI 双终端并行时的独立登录态
+# UI 单进程下任务串行调度, 散片与合集共用主 profile(一次登录全模式可用)
 
 # 标题垃圾过滤（用户要求: 只收故事性内容, 不要抖音日记/日常 vlog）。
 # 只匹配标题不匹配简介——故事号简介常含"日常更新"不能误伤
@@ -57,25 +62,8 @@ JUNK_TITLE_KEYWORDS = [
 
 # ---------- selftest ----------
 
-def _collect_selftests():
-    return sorted(
-        (name, fn) for name, fn in globals().items()
-        if name.startswith("test_") and callable(fn)
-    )
-
-
 def run_selftests():
-    tests = _collect_selftests()
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(f"  FAIL {name}: {type(e).__name__}: {e}")
-    print(f"selftest: {len(tests) - failed}/{len(tests)} 项通过")
-    return failed == 0
+    return core.selftest.run_selftests(globals())
 
 
 # ---------- 纯逻辑 ----------
@@ -170,11 +158,9 @@ def test_roll_date_dir_midnight_switch():
         (bucket / "a_7300000000000000001.mp4").write_bytes(b"x")
         cur = {"dir": old_day}
         # 时间来到 09-05: 旧目录定稿 + 切到新日期目录
-        with mock.patch.object(time, "strftime", return_value="2026-09-05"), \
-             mock.patch.object(ds, "DOWNLOADS_DIR", root), \
-             mock.patch.object(ds, "make_dated_dir",
-                               side_effect=lambda r: r / "2026-09-05"):
-            got = ds.roll_date_dir(cur, on_switch=finalize_buckets)
+        # (roll_date_dir 已参数化 root——显式传入即可，无需 patch 全局)
+        with mock.patch.object(time, "strftime", return_value="2026-09-05"):
+            got = ds.roll_date_dir(cur, root, on_switch=finalize_buckets)
         assert got == root / "2026-09-05"
         assert cur["dir"] == got, "cur 引用必须同步更新"
         assert (old_day / "散片" / "23点50分(1)").is_dir(), "旧日期要收尾定稿"
@@ -184,7 +170,7 @@ def test_roll_date_dir_midnight_switch():
         same.mkdir()
         cur2 = {"dir": same}
         with mock.patch.object(time, "strftime", return_value="2026-09-05"):
-            assert ds.roll_date_dir(cur2) is same
+            assert ds.roll_date_dir(cur2, same.parent) is same
 
 
 
@@ -228,44 +214,30 @@ def finalize_buckets(out_dir: Path, only_before: str = None) -> None:
             continue
         t = d.with_name(target)
         if t.exists():
-            print(f"  !! 桶目录冲突跳过: {d.name} -> {target}", flush=True)
+            log(f"  !! 桶目录冲突跳过: {d.name} -> {target}", flush=True)
             continue
         try:
             d.rename(t)
-            print(f"  ↳ 桶定稿: {target}", flush=True)
+            log(f"  ↳ 桶定稿: {target}", flush=True)
         except Exception:
             pass
 
 
-# ---------- 散片独立状态（与合集 auto_state.json 互不串账） ----------
+# ---------- 散片独立状态（与合集 auto_state.json 互不串账；实现收敛 core.state） ----------
+
+STATE_FILE = "clips_state.json"
+
 
 def load_state(out_dir: Path) -> dict:
-    p = out_dir / "clips_state.json"
-    if p.exists():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data.get("processed"), dict):
-                return data
-        except Exception:
-            pass
-    return {"processed": {}}
+    return cs.load_state(out_dir, STATE_FILE)
 
 
 def save_state(out_dir: Path, state: dict) -> None:
-    (out_dir / "clips_state.json").write_text(
-        json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    cs.save_state(out_dir, state, STATE_FILE)
 
 
 def reconcile_state(out_dir: Path, state: dict) -> None:
-    alive = ds.existing_ids_under(ds.DOWNLOADS_DIR)
-    drop = [vid for vid, v in state["processed"].items()
-            if v.get("verdict") in ("clean", "watermarked")
-            and vid not in alive]
-    for vid in drop:
-        del state["processed"][vid]
-    if drop:
-        save_state(out_dir, state)
-        print(f"[状态清理] {len(drop)} 条记录的文件已不存在，已重置")
+    cs.reconcile_state(out_dir, state, STATE_FILE)
 
 
 # ---------- 收集（独立实现，不动合集脚本） ----------
@@ -281,8 +253,8 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
     """
     max_followers, max_duration, max_likes = filters
     handled = 0
-    with ds.open_browser(profile_dir=CLIPS_PROFILE_DIR) as ctx:
-        page = ds._first_page(ctx)
+    with ds.open_browser() as ctx:  # 共用主 profile(UI 串行调度无锁冲突)
+        page = ds.first_page(ctx)
         worker = {"page": ctx.new_page()}
 
         def get_worker_page():
@@ -290,18 +262,18 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
             (Tab Discard)，用时检查 is_closed，关了就地重开。"""
             pg = worker["page"]
             if pg.is_closed():
-                print("  (兜底页签失效，重开)", flush=True)
+                log("  (兜底页签失效，重开)", flush=True)
                 pg = ctx.new_page()
                 worker["page"] = pg
             return pg
 
-        ds.ensure_login(ctx, page)
+        ds.ensure_login(ctx, page, ds.DOUYIN_HOME)
         stop = {"flag": False}
 
         for idx, kw in enumerate(keywords, 1):
             if stop["flag"]:
                 break
-            print(f"\n=== 关键词 [{idx}/{len(keywords)}] {kw} ===",
+            log(f"\n=== 关键词 [{idx}/{len(keywords)}] {kw} ===",
                   flush=True)
             seen_local, raw, scanned, mix_skipped, junk = set(), 0, 0, 0, 0
             state = {"verify": False, "prompted": False}
@@ -343,7 +315,7 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                             continue
                         pending.append(it)
                     else:
-                        print(f"  跳过: "
+                        log(f"  跳过: "
                               f"{(it['title'] or it['aweme_id'])[:24]}"
                               f"（{reason}）", flush=True)
 
@@ -366,22 +338,23 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
             try:
                 for url in clip_routes(kw):
                     page.goto(url, timeout=30000)
-                    ds._wait_captcha(page)
+                    ds.wait_captcha(page)
                     probe = time.time() + 12
                     while time.time() < probe and scanned == 0:
                         page.wait_for_timeout(1500)
                     if scanned:
                         break
-                    print(f"  (路由 {url.split('/')[3]} 无数据，切换…)",
+                    log(f"  (路由 {url.split('/')[3]} 无数据，切换…)",
                           flush=True)
                 # 长等待滑块
                 deadline = time.time() + ds.VERIFY_WAIT
                 while scanned == 0 and time.time() < deadline:
+                    checkpoint()
                     if state["verify"] and not state["prompted"]:
-                        print(">>> 触发滑块验证：请在浏览器窗口中拖动完成拼图"
-                              " <<<", flush=True)
+                        urgent(">>> 触发滑块验证：请在浏览器窗口中拖动完成拼图 <<<")
                         state["prompted"] = True
                     page.wait_for_timeout(1500)
+                checkpoint()
                 drain()  # 首屏合格候选立即开始下载
                 # 翻页推进以 scanned(含已下载)计——旧数据页不算"无进展",
                 # 否则二轮搜索翻不过前几页已下载内容
@@ -394,9 +367,9 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                         # 部分（seen_local 去重，不会重复处理）
                         rescan["target"] = scanned
                         rescan["steps"] = 0
-                        print("  (定期重载搜索页，释放 DOM 内存…)", flush=True)
+                        log("  (定期重载搜索页，释放 DOM 内存…)", flush=True)
                         page.reload(timeout=30000)
-                        ds._wait_captcha(page)
+                        ds.wait_captcha(page)
                         page.wait_for_timeout(2000)
                         last_reload = time.time()
                         idle = 0
@@ -420,7 +393,7 @@ def collect_clips_stream(keywords, filters, block_keywords, done_ids,
                     idle = 0 if scanned > before else idle + 1
             finally:
                 page.remove_listener("response", on_response)
-            print(f"  (「{kw}」扫描 {scanned} 条，已下载跳过 "
+            log(f"  (「{kw}」扫描 {scanned} 条，已下载跳过 "
                   f"{scanned - raw} 条，合集让给jx {mix_skipped} 条，"
                   f"日记vlog拦 {junk} 条，"
                   f"散片新候选 {raw - mix_skipped - junk} 条)", flush=True)
@@ -437,7 +410,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
     reconcile_state(out_dir, state)
     done_ids = (set(state["processed"])
                 | ds.existing_ids_under(ds.DOWNLOADS_DIR))
-    print(f"起点: 已处理 {len(done_ids)} 条")
+    log(f"起点: 已处理 {len(done_ids)} 条")
     stat = {"clean": 0, "wm": 0}
 
     # --limit 语义: 本轮新增 N 条干净（与 jx 一致）；去重靠 done_ids，
@@ -454,7 +427,7 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
         vid, title = it["aweme_id"], it["title"]
         if vid in state["processed"]:
             return clean >= limit
-        print(f"\n→ [{clean + 1}/{limit}] {title[:32] or vid}", flush=True)
+        log(f"\n→ [{clean + 1}/{limit}] {title[:32] or vid}", flush=True)
         # 10 分钟分桶：与"剧集"同级 → 日期/散片/HH点MM分/（跨午夜先翻日）
         cdir = bucket_dir(ds.roll_date_dir(cur, on_switch=finalize_buckets))
         q = cdir / "疑似水印"
@@ -465,23 +438,24 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
             state["processed"][vid] = {"verdict": "skip", "desc": str(e)}
             save_state(cur["dir"], state)
         except Exception as e:  # noqa: BLE001 - 失败可重试
-            if douyin_dl.is_conn_dead(e):
+            if is_conn_dead(e):
                 # 浏览器/driver 整体断连（崩溃或被关）——继续只会逐条
                 # 空烧，停本轮；进度按条保存，重跑同命令自动续
-                print("  !! 浏览器已断开，停止本轮（重跑同命令续传）",
+                log("  !! 浏览器已断开，停止本轮（重跑同命令续传）",
                       flush=True)
                 return True
-            print(f"  下载失败（重跑续传）: {e}")
+            log(f"  下载失败（重跑续传）: {e}")
             time.sleep(2)
             return clean >= limit
         f = douyin_auto.find_by_id(cdir, vid)
         if not f:
             return clean >= limit
         try:
-            v = douyin_auto.judge_file(f, api_key, base_url, model,
-                                       FRAMES, cdir / ".wm_frames")
+            v = wf.judge_file(f, api_key, base_url, model,
+                              FRAMES, cdir / ".wm_frames",
+                              author=it.get("nick") or "")
         except Exception as e:  # noqa: BLE001 - 识图失败保留重判
-            print(f"  识图失败（保留，重跑重判）: {e}")
+            log(f"  识图失败（保留，重跑重判）: {e}")
             return clean >= limit
         if v.get("has_author_watermark"):
             q.mkdir(exist_ok=True)
@@ -489,12 +463,14 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
             state["processed"][vid] = {
                 "verdict": "watermarked",
                 "desc": v.get("desc", "")[:60]}
-            print(f"  ⚠ 有作者水印 → 移走", flush=True)
+            log(f"  ⚠ 有作者水印 → 移走", flush=True)
             stat["wm"] += 1
         else:
             state["processed"][vid] = {"verdict": "clean"}
             clean += 1
-            print(f"  ✓ 干净，计入 [{clean}/{limit}]", flush=True)
+            log(f"  ✓ 干净，计入 [{clean}/{limit}]", flush=True)
+            event({"type": "progress", "done": clean, "total": limit,
+                   "unit": "条", "now": f"已收 {clean}/{limit} 条干净散片"})
             stat["clean"] += 1
         save_state(cur["dir"], state)
         time.sleep(random.uniform(1, 2))
@@ -507,13 +483,14 @@ def run(keywords, limit, filters, block_keywords, api_key, base_url,
                                        min_duration=min_duration,
                                        out_dirs=cur)
         if not handled:
-            print("!! 没有新候选（关键词翻尽或全被筛选/去重排除）")
+            log("!! 没有新候选（关键词翻尽或全被筛选/去重排除）")
     finally:
         # 无论正常结束/中断(Ctrl+C)/报错，都给桶目录定稿条数
         finalize_buckets(cur["dir"])
-    print(f"\n==== 结束 ====")
-    print(f"本轮干净散片 {clean}/{limit}｜水印移走 {stat['wm']}")
-    print(f"散片目录: {cur['dir'] / '散片'}")
+    event({"type": "done", "done": clean, "total": limit})
+    log(f"\n==== 结束 ====")
+    log(f"本轮干净散片 {clean}/{limit}｜水印移走 {stat['wm']}")
+    log(f"散片目录: {cur['dir'] / '散片'}")
 
 
 def main(argv=None):
@@ -540,17 +517,17 @@ def main(argv=None):
     if not args.keyword:
         parser.error("请提供搜索关键词")
     if not api_key:
-        print("错误: 未设置 DASHSCOPE_API_KEY（key.txt 或环境变量）",
+        log("错误: 未设置 DASHSCOPE_API_KEY（key.txt 或环境变量）",
               file=sys.stderr)
         sys.exit(1)
     keywords = ds.split_keywords(args.keyword)
     out_dir = ds.make_dated_dir(ds.DOWNLOADS_DIR)
-    print(f"输出目录: {out_dir / '散片'}（按 10 分钟分桶）")
+    log(f"输出目录: {out_dir / '散片'}（按 10 分钟分桶）")
     filters = (args.max_followers, args.max_duration, args.max_likes)
     if any(v is not None for v in filters):
-        print(f"筛选: 粉丝<{args.max_followers or '∞'} "
+        log(f"筛选: 粉丝<{args.max_followers or '∞'} "
               f"时长<{args.max_duration or '∞'}s 赞<{args.max_likes or '∞'}")
-    print(f"水印判定: {FRAMES} 帧/条")
+    log(f"水印判定: {FRAMES} 帧/条")
     if args.block_keywords is None:
         block_kw = ds.DEFAULT_BLOCK_KEYWORDS
     else:
@@ -560,7 +537,7 @@ def main(argv=None):
             args.base_url, args.model, out_dir,
             min_duration=args.min_duration or None)
     except KeyboardInterrupt:
-        print("\n中断（进度已保存，重跑同命令自动续）")
+        log("\n中断（进度已保存，重跑同命令自动续）")
         sys.exit(1)
 
 

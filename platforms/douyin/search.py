@@ -1,61 +1,38 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""douyin_search.py — 抖音关键词搜索 + 批量无水印下载
-依赖 douyin_dl.py（下载）与 playwright（搜索）。
+"""platforms.douyin.search — 抖音关键词搜索 + 合集/主页收集 + 付费检测
+
+依赖 core（浏览器/筛选/命名）与 platforms.douyin.dl（单条下载）。
 仅限个人离线保存；请尊重创作者版权，勿二次上传。
 """
 import argparse
-import json
 import random
 import re
 import sys
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-import douyin_dl
-import series_detect
+import core.selftest
+from core.reporting import log, urgent
+from core import selftest as _st
+from core.browser import (checkpoint, ensure_login, first_page,
+                          login_only, open_browser, resp_json, wait_captcha)
+from core.errors import SearchError
+from core.filter import DEFAULT_BLOCK_KEYWORDS, author_blocked, passes_filter
+from core.naming import (episode_prefix, existing_ids_under, make_dated_dir,
+                         roll_date_dir, safe_dir_name, split_keywords)
+from core.paths import APP_ROOT as SCRIPT_DIR
+from core.paths import DOWNLOADS_DIR
+from platforms.douyin.config import (DETAIL_SUBSTR, EPISODE_URL_SUBSTRS,
+                                     LOGIN_TIMEOUT, MAX_IDLE_SCROLLS,
+                                     SCROLL_WAIT, SEARCH_RELOAD_S,
+                                     SEARCH_URL_PREFIX, USER_POST_URL_SUBSTR,
+                                     VERIFY_WAIT)
+from platforms.douyin.dl import ParseError, run as dl_run
 
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_OK = True
-except ImportError:
-    PLAYWRIGHT_OK = False
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = SCRIPT_DIR / ".browser-profile"
-DOWNLOADS_DIR = SCRIPT_DIR / "downloads"
-SEARCH_URL_PREFIX = "aweme/v1/web/search/item/"
-LOGIN_TIMEOUT = 120
-VERIFY_WAIT = 240          # 滑块验证最长等待（实测用户可能不在屏幕前）
-SCROLL_WAIT = 1.5
-MAX_IDLE_SCROLLS = 3
-# 长跑定期重载搜索页（秒）：搜索结果卡片只增不删，DOM 无限膨胀是
-# 通宵跑浏览器内存暴涨/崩溃的主因；重载后快进重扫已见内容（seen 去重）
-SEARCH_RELOAD_S = 1500
-
-
-class SearchError(Exception):
-    """搜索/登录流程失败。"""
-
-
-# 剧集面板接口有两种形态：合集(mix)与系列(series)，实测(2026-09)同一作者
-# 只命中其中一种，两种都要拦
-EPISODE_URL_SUBSTRS = ("/aweme/v1/web/mix/aweme/", "/aweme/v1/web/series/aweme/")
-USER_POST_URL_SUBSTR = "/aweme/v1/web/aweme/post/"
-
-
-def resp_json(resp):
-    """playwright resp.json() 实测(2026-09)对部分抖音接口会抛错，
-    统一走 text()+json.loads 兜底；失败返回 None。"""
-    try:
-        return resp.json()
-    except Exception:
-        try:
-            return json.loads(resp.text())
-        except Exception:
-            return None
+DOUYIN_HOME = "https://www.douyin.com/"  # 登录首页
+PAID_DETAIL_SUBSTR = DETAIL_SUBSTR       # 付费检测拦同一 detail 接口
 
 
 # ---------- 纯逻辑：搜索响应解析 ----------
@@ -98,40 +75,6 @@ def parse_search_response(payload: dict, seen: set):
     return results
 
 
-DEFAULT_BLOCK_KEYWORDS = [
-    # 搬运/二传声明
-    "搬运", "转载", "二传", "搬用", "搬运工", "全网搬运",
-    "每日搬运", "搬运合集", "影视搬运",
-    # 侵权/删除类免责声明
-    "侵权", "联系删除", "如有侵权", "侵权删", "侵权请联系",
-    "私聊删除", "侵删", "违规请联系",
-    # 仅供类免责
-    "仅供欣赏", "仅供学习", "仅供交流", "仅供个人", "仅供参考",
-    "仅供娱乐", "请勿商用", "禁止商用", "勿用于商业",
-    # 禁止类
-    "禁止搬运", "禁搬运", "请勿搬运", "勿搬运", "禁止转载",
-    "严禁搬运", "严禁转载", "禁止二传", "禁止二次上传",
-    # 出处/来源声明（搬运号常见）
-    "出处见水印", "来源见水印", "版权归原", "版权归作者",
-    "原作者", "原创作者所有", "视频来源网络", "素材来源网络",
-    "如有侵权请", "联系我删除",
-    # 免责
-    "免责", "免责声明",
-]
-
-
-def author_blocked(item: dict, keywords):
-    """作者简介/昵称/视频标题命中黑名单关键词（搬运/侵权类账号）。"""
-    if not keywords:
-        return False, ""
-    text = " ".join([item.get("sig", ""), item.get("nick", ""),
-                     item.get("title", "")])
-    for kw in keywords:
-        if kw and kw in text:
-            return True, kw
-    return False, ""
-
-
 def parse_mix_response(payload: dict, seen: set):
     """mix/series 接口响应 → 新增集条目 [{aweme_id,title,ep,ct,dur}]。
 
@@ -161,32 +104,6 @@ def sort_episodes(items):
     return sorted(items, key=lambda x: x.get("ct") or 0)
 
 
-def episode_prefix(n: int, total: int) -> str:
-    """集数文件名前缀：零填充保证资源管理器按名排序即观看顺序。"""
-    width = max(2, len(str(max(total, 1))))
-    return f"{n:0{width}d}_"
-
-
-def looks_continuous(eps):
-    """合集标题是否像同一部连续剧集（防"杂物合集"误下整部）。
-
-    判据（满足其一）：≥2 个标题带集数标记；或 ≥60% 标题共享前 6 字前缀。
-    返回 (是否连续, 依据说明)。
-    """
-    titles = [(e.get("title") or "").strip() for e in eps]
-    titles = [t.split("#")[0].strip() or t for t in titles]  # 去话题标签
-    if len(titles) < 2:
-        return False, "集数不足 2"
-    hint = sum(1 for t in titles if series_detect.episode_hint(t))
-    if hint >= 2:
-        return True, f"{hint} 个标题带集数标记"
-    prefix = titles[0][:6]
-    same = sum(1 for t in titles if t[:6] == prefix)
-    if same >= max(2, len(titles) * 0.6):
-        return True, f"{same}/{len(titles)} 标题共享前缀「{prefix}」"
-    return False, "标题混杂（无集数标记也无共同前缀）"
-
-
 def is_verify_block(payload: dict) -> bool:
     """识别风控软拦截：HTTP 200 + status_code 0 + search_nil_info 标记。"""
     nil = payload.get("search_nil_info") or {}
@@ -194,9 +111,6 @@ def is_verify_block(payload: dict) -> bool:
 
 
 # ---------- 付费检测 ----------
-
-PAID_DETAIL_SUBSTR = "/aweme/v1/web/aweme/detail/"
-
 
 def is_paid_aweme(payload: dict) -> bool:
     """从 detail 接口响应判定是否付费/试看内容。
@@ -254,7 +168,7 @@ def check_paid_entry(page, entry_aweme_id: str, timeout: int = 15) -> bool:
     try:
         page.goto(f"https://www.douyin.com/video/{entry_aweme_id}",
                   timeout=30000)
-        _wait_captcha(page)
+        wait_captcha(page)
         deadline = time.time() + timeout
         while time.time() < deadline and not got:
             page.wait_for_timeout(1000)
@@ -263,48 +177,6 @@ def check_paid_entry(page, entry_aweme_id: str, timeout: int = 15) -> bool:
     if not got:
         return False
     return is_paid_aweme(got[0])
-
-
-def split_keywords(text: str):
-    """按中英文逗号拆分关键词，去空白与空项。"""
-    return [k.strip() for k in re.split(r"[,，]", text) if k.strip()]
-
-
-def passes_filter(item: dict, max_followers=None, max_duration=None,
-                  max_likes=None, min_duration=None):
-    """筛选判定：严格小于/大于才保留；启用的条件遇字段未知即拒绝。
-
-    min_duration: 时长下限（秒），严格大于才保留（滤过短碎片）。
-    """
-    if min_duration:
-        if item["duration_ms"] is None:
-            return False, "时长未知"
-        if item["duration_ms"] <= min_duration * 1000:
-            return False, \
-                f"时长 {item['duration_ms'] // 1000}s <= {min_duration}s"
-    if max_likes is not None:
-        if item["digg"] is None:
-            return False, "点赞数未知"
-        if item["digg"] >= max_likes:
-            return False, f"点赞 {item['digg']} >= {max_likes}"
-    if max_duration is not None:
-        if item["duration_ms"] is None:
-            return False, "时长未知"
-        if item["duration_ms"] >= max_duration * 1000:
-            return False, \
-                f"时长 {item['duration_ms'] // 1000}s >= {max_duration}s"
-    if max_followers is not None:
-        if item["followers"] is None:
-            return False, "粉丝数未知"
-        if item["followers"] >= max_followers:
-            return False, f"粉丝 {item['followers']} >= {max_followers}"
-    return True, ""
-
-
-def has_login(cookies) -> bool:
-    """playwright context.cookies() 中存在非空 sessionid 即视为已登录。"""
-    return any(c.get("name") == "sessionid" and c.get("value")
-               for c in cookies)
 
 
 def _search_urls(keyword: str, prefer_jingxuan: bool = False):
@@ -317,263 +189,6 @@ def _search_urls(keyword: str, prefer_jingxuan: bool = False):
     urls = [f"https://www.douyin.com/search/{kw}?type=video",
             f"https://www.douyin.com/jingxuan/search/{kw}?type=video"]
     return urls[::-1] if prefer_jingxuan else urls
-
-
-def safe_dir_name(name: str) -> str:
-    """清洗为合法目录名：非法字符→空格、strip、截 50 字符。"""
-    return douyin_dl.INVALID_FN_RE.sub(" ", name).strip()[:50]
-
-
-def make_dated_dir(root: Path) -> Path:
-    """按日期建目录 downloads/YYYY-MM-DD。
-
-    同一天多次运行共用同一目录（数据叠加）——去重由全局 ID 扫描保证，
-    状态文件/视频清单在同日内累积，断点续跑更顺。
-    """
-    d = root / time.strftime("%Y-%m-%d")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def roll_date_dir(cur: dict, on_switch=None) -> Path:
-    """跨午夜翻日期目录（通宵跑场景）：cur["dir"] 名 ≠ 今天 → 切到
-    downloads/新日期/ 并更新 cur["dir"]；同一天原样返回。
-
-    on_switch(旧目录): 切换前回调（散片模式用来给旧目录的桶收尾定稿）。
-    调用粒度由调用方决定——散片每条一查，合集每部剧一查（不拆一部剧）。
-    """
-    today = time.strftime("%Y-%m-%d")
-    if cur["dir"].name != today:
-        old = cur["dir"]
-        if on_switch:
-            on_switch(old)
-        cur["dir"] = make_dated_dir(DOWNLOADS_DIR)
-        print(f"\n↳ 跨过午夜 → 切换日期目录 {old.name} → {cur['dir'].name}",
-              flush=True)
-    return cur["dir"]
-
-
-def existing_ids_under(root: Path) -> set:
-    """递归收集 root 下所有 mp4 文件名尾部的视频 ID（跨目录全局去重）。"""
-    ids = set()
-    if root.is_dir():
-        for f in root.rglob("*.mp4"):
-            m = re.search(r"_(\d{15,})\.mp4$", f.name)
-            if m:
-                ids.add(m.group(1))
-    return ids
-
-
-# ---------- 浏览器层 ----------
-
-@contextmanager
-def open_browser(profile_dir: Path = None):
-    """打开持久化登录浏览器。profile_dir 指定独立 profile 目录
-    （散片并行模式传 .browser-profile-clips，与合集互不抢 Chromium 锁）。"""
-    if not PLAYWRIGHT_OK:
-        raise SearchError(
-            "playwright 未安装。先执行: "
-            "pip install playwright && playwright install chromium")
-    try:
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir or PROFILE_DIR), headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"],
-                viewport={"width": 1280, "height": 900})
-            # 降低自动化指纹，减少风控验证码概率（实测 2026-09）
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver',"
-                " {get: () => undefined})")
-            try:
-                yield context
-            finally:
-                context.close()
-    except SearchError:
-        raise
-    except Exception as e:  # playwright.Error 等
-        if "Executable doesn't exist" in str(e):
-            raise SearchError(
-                "Chromium 未下载。先执行: playwright install chromium")
-        raise SearchError(f"浏览器错误: {e}")
-
-
-def _first_page(context):
-    return context.pages[0] if context.pages else context.new_page()
-
-
-def ensure_login(context, page) -> None:
-    if has_login(context.cookies()):
-        return
-    print("未检测到登录态：请在打开的浏览器窗口中扫码登录抖音…")
-    page.goto("https://www.douyin.com/", timeout=30000)
-    deadline = time.time() + LOGIN_TIMEOUT
-    while time.time() < deadline:
-        if has_login(context.cookies()):
-            print("登录成功。")
-            return
-        page.wait_for_timeout(2000)
-    raise SearchError(f"扫码超时（{LOGIN_TIMEOUT}s），请重跑 --login")
-
-
-def login_only() -> None:
-    with open_browser() as context:
-        ensure_login(context, _first_page(context))
-
-
-def _wait_captcha(page, timeout=90) -> None:
-    """标题含"验证"时提示用户手动完成验证码并等待放行。"""
-    prompted = False
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if "验证" not in page.title():
-            return
-        if not prompted:
-            print(">>> 触发验证码：请在浏览器窗口中手动完成验证 <<<", flush=True)
-            prompted = True
-        page.wait_for_timeout(2000)
-    raise SearchError(f"验证码等待超时（{timeout}s）")
-
-
-def _collect_page(context, page, keyword, limit, max_followers=None,
-                  max_duration=None, max_likes=None, seen=None,
-                  block_keywords=None, prefer_jingxuan=False,
-                  min_duration=None):
-    """单个关键词的搜索收集（在已打开的浏览器页签内跳转）。
-
-    成功返回合格列表；验证超时/无数据抛 SearchError（由调用方决定是否继续）。
-    """
-    done = seen if seen is not None else set()
-    seen_local = set()  # 本轮解析去重(不含历史; 已见条目计入 scanned 推进)
-    kept, raw, scanned = [], 0, 0
-    state = {"verify": False, "prompted": False, "prompted_at": 0.0,
-             "reloaded": False}
-
-    def on_response(resp):
-        nonlocal raw, scanned
-        if SEARCH_URL_PREFIX not in resp.url:
-            return
-        try:
-            payload = resp.json()
-        except Exception:
-            return  # 非 JSON / 请求失败
-        if is_verify_block(payload):
-            state["verify"] = True
-            return
-        state["verify"] = False
-        for it in parse_search_response(payload, seen_local):
-            scanned += 1
-            if it["aweme_id"] in done:
-                continue  # 历史/前轮已见: 静默跳过但计入推进
-            raw += 1
-            ok, reason = passes_filter(it, max_followers, max_duration,
-                                       max_likes, min_duration)
-            if ok:
-                bad, kw = author_blocked(it, block_keywords)
-                if bad:
-                    print(f"  跳过: {(it['title'] or it['aweme_id'])[:24]}"
-                          f"（作者黑名单: 简介含「{kw}」）", flush=True)
-                    continue
-                kept.append(it)
-            else:
-                print(f"  跳过: {(it['title'] or it['aweme_id'])[:24]}"
-                      f"（{reason}）", flush=True)
-
-    # 关键：监听器必须在 goto 之前挂上——搜索 XHR 在页面加载瞬间发出
-    page.on("response", on_response)
-    try:
-        # 路由探测：标准 /search/ 12s 内无数据（含 503）→ 换 jingxuan 兜底
-        route = ""
-        for url in _search_urls(keyword, prefer_jingxuan):
-            resp = page.goto(url, timeout=30000)
-            route = url.split("/")[3] or "(根)"
-            status = resp.status if resp else "?"
-            landed = ((resp.url if resp else "?").split("/")[3]
-                      if resp else "?")
-            _wait_captcha(page)
-            probe_deadline = time.time() + 12
-            while scanned == 0 and time.time() < probe_deadline:
-                page.wait_for_timeout(1500)
-            if scanned:
-                extra = f"（被跳转到 {landed}）" if landed != route else ""
-                print(f"  (路由 {route} 命中{extra})", flush=True)
-                break
-            print(f"  (路由 {route} 无数据[HTTP {status}]"
-                  f"实际落点 {landed}，切换下一条路由…)", flush=True)
-        # 长等待：等首条有数据的响应；遇软拦截(verify_check)提示用户滑验证。
-        # 提示 90s 后仍无数据则刷新页面重发搜索（验证通过后刷新即可拿到）
-        first_deadline = time.time() + VERIFY_WAIT
-        while scanned == 0 and time.time() < first_deadline:
-            if state["verify"] and not state["prompted"]:
-                print(">>> 触发滑块验证：请在浏览器窗口中拖动滑块完成拼图 <<<",
-                      flush=True)
-                state["prompted"] = True
-                state["prompted_at"] = time.time()
-            if (state["prompted"] and not state["reloaded"]
-                    and time.time() - state["prompted_at"] > 90):
-                print("  (刷新页面重新触发搜索…)", flush=True)
-                page.reload(timeout=30000)
-                _wait_captcha(page)
-                state["reloaded"] = True
-            page.wait_for_timeout(1500)
-        idle = 0
-        while len(kept) < limit and idle < MAX_IDLE_SCROLLS:
-            before = scanned
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(int(SCROLL_WAIT * 1000))
-            idle = 0 if scanned > before else idle + 1
-    finally:
-        page.remove_listener("response", on_response)
-    if raw == 0:
-        if state["verify"]:
-            raise SearchError(f"[{keyword}] 验证未完成或未通过")
-        raise SearchError(f"[{keyword}] 未拦截到搜索响应：可能改版或风控")
-    print(f"本词合格 {len(kept)} / 共 {raw} 条")
-    return kept[:limit]
-
-
-def collect_many(keywords, limit, max_followers=None, max_duration=None,
-                 max_likes=None, seen=None, block_keywords=None,
-                 prefer_jingxuan=False, min_duration=None):
-    """多关键词聚合：开一次浏览器，逐词收集，全局去重，凑够 limit 即停。
-
-    seen: 额外提供的"已处理 ID 集合"（流水线复用，跳过历史视频）。
-    block_keywords: 作者黑名单关键词（过滤搬运/侵权类账号）。
-    prefer_jingxuan: 精选路由优先。
-    注意：复制入参 set —— 搜索命中的候选 ID 不会污染调用方集合
-    （否则入口候选视频作为剧集分集时会被误判"已处理"而静默跳过）。
-    """
-    seen_ids = set(seen) if seen is not None else set()
-    merged = []
-    with open_browser() as context:
-        page = _first_page(context)
-        ensure_login(context, page)
-        for idx, kw in enumerate(keywords, 1):
-            if len(merged) >= limit:
-                break
-            remaining = limit - len(merged)
-            print(f"\n=== 关键词 [{idx}/{len(keywords)}] {kw}"
-                  f"（还需 {remaining} 条）===", flush=True)
-            try:
-                merged.extend(_collect_page(context, page, kw, remaining,
-                                            max_followers, max_duration,
-                                            max_likes, seen_ids,
-                                            block_keywords,
-                                            prefer_jingxuan,
-                                            min_duration))
-            except SearchError as e:
-                print(f"  !! {e}，跳到下一个关键词", flush=True)
-            print(f"累计合格 {len(merged)}/{limit}")
-            if idx < len(keywords) and len(merged) < limit:
-                time.sleep(random.uniform(3, 5))  # 词间降温
-    return merged[:limit]
-
-
-def _compilation_url(sec_uid: str) -> str:
-    """作者主页合集子标签 URL（不带 modal_id——modal 是视频播放流，滚它会
-    滚进推荐流且从中段集数回不到第 1 集；要的是合集列表视图）。"""
-    return (f"https://www.douyin.com/user/{sec_uid}"
-            f"?showSubTab=compilation&showTab=post")
 
 
 def _episode_collection_id(url: str):
@@ -603,13 +218,13 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
         return True
 
     with open_browser() as context:
-        page = _first_page(context)
-        ensure_login(context, page)
+        page = first_page(context)
+        ensure_login(context, page, DOUYIN_HOME)
         if not sec_uid:
             got = {}
 
             def on_detail(r):
-                if "/aweme/v1/web/aweme/detail/" in r.url:
+                if DETAIL_SUBSTR in r.url:
                     p = resp_json(r)
                     if p:
                         got["d"] = p.get("aweme_detail") or p
@@ -618,7 +233,7 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
             try:
                 page.goto(f"https://www.douyin.com/video/{video_id}",
                           timeout=30000)
-                _wait_captcha(page)
+                wait_captcha(page)
                 deadline = time.time() + 20
                 while time.time() < deadline and "d" not in got:
                     page.wait_for_timeout(1500)
@@ -632,7 +247,7 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
         # ① 合集标签页
         page.goto(f"https://www.douyin.com/user/{sec_uid}"
                   "?showSubTab=compilation&showTab=post", timeout=30000)
-        _wait_captcha(page)
+        wait_captcha(page)
         # ② 点开目标短剧卡片（"更新至N集"叶子向上爬到含剧名的容器）
         card_total = None
         if mix_name:
@@ -651,7 +266,7 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
                                 const t = el.innerText || '';
                                 if (t.includes(name)) {
                                     el.click();
-                                    return t.replace(/\n/g, ' ')
+                                    return t.replace(/\\n/g, ' ')
                                              .slice(0, 80);
                                 }
                                 el = el.parentElement;
@@ -662,12 +277,12 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
                 if not clicked:
                     page.wait_for_timeout(1500)
             if clicked:
-                print(f"  (已进入短剧页: {clicked[:50]})", flush=True)
+                log(f"  (已进入短剧页: {clicked[:50]})", flush=True)
                 m = re.search(r"更新至\s*(\d+)\s*集", clicked)
                 if m:
                     card_total = int(m.group(1))
             else:
-                print("  (未找到合集卡片)", flush=True)
+                log("  (未找到合集卡片)", flush=True)
             page.wait_for_timeout(2500)
 
         # ③ 短剧页拦截剧集接口，滚动拉全
@@ -688,7 +303,7 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
                 return
             if fresh:
                 items.extend(fresh)
-                print(f"  (+{len(fresh)} 集, 累计 {len(items)})", flush=True)
+                log(f"  (+{len(fresh)} 集, 累计 {len(items)})", flush=True)
 
         page.on("response", on_response)
         try:
@@ -697,6 +312,7 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
                 page.wait_for_timeout(1500)
             idle = 0
             while idle < 15:
+                checkpoint()
                 if state["total"] and len(items) >= state["total"]:
                     break
                 before = len(items)
@@ -726,11 +342,11 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
         finally:
             page.remove_listener("response", on_response)
         if state["total"] and len(items) < state["total"]:
-            print(f"  ⚠ 短剧页只拿到 {len(items)}/{state['total']} 集，"
+            log(f"  ⚠ 短剧页只拿到 {len(items)}/{state['total']} 集，"
                   f"转作品流兜底", flush=True)
         if len(items) >= 2:
             if state["total"]:
-                print(f"  (短剧页拿到 {len(items)}/{state['total']} 集)",
+                log(f"  (短剧页拿到 {len(items)}/{state['total']} 集)",
                       flush=True)
             return sort_episodes(items)
 
@@ -747,9 +363,10 @@ def collect_mix(video_id: str, sec_uid: str = "", mix_id="", mix_name=""):
         if not eps:
             raise SearchError(
                 f"短剧页与作品流均未拿到分集（目标={state['target'] or '?'}）")
-        print(f"  (作品流兜底分组: {len(eps)} 集)", flush=True)
+        log(f"  (作品流兜底分组: {len(eps)} 集)", flush=True)
         return [{"aweme_id": p["aweme_id"], "title": p["title"],
                  "ep": 0, "ct": p["create_time"]} for p in eps]
+
 
 def parse_post_response(payload: dict, seen: set):
     """作者主页作品接口 → 新增 [{aweme_id, title, create_time, sid}]。
@@ -793,7 +410,7 @@ def _collect_posts_in_page(page, max_scrolls=120):
 
     page.on("response", on_response)
     try:
-        _wait_captcha(page)
+        wait_captcha(page)
         deadline = time.time() + 20
         while time.time() < deadline:
             if items:
@@ -807,7 +424,7 @@ def _collect_posts_in_page(page, max_scrolls=120):
                           page.inner_text("body")[:3000])
             if m:
                 expected = int(m.group(1))
-                print(f"  (主页作品总数: {expected})", flush=True)
+                log(f"  (主页作品总数: {expected})", flush=True)
         except Exception:
             pass
         # 滚动翻页加载全部作品；has_more=0 或达主页总数 停；
@@ -816,6 +433,7 @@ def _collect_posts_in_page(page, max_scrolls=120):
         while (state["has_more"] and idle < 20
                and scrolls < max_scrolls
                and not (expected and len(items) >= expected)):
+            checkpoint()
             before = len(items)
             try:
                 page.evaluate(
@@ -827,7 +445,7 @@ def _collect_posts_in_page(page, max_scrolls=120):
             idle = 0 if len(items) > before else idle + 1
             scrolls += 1
         if expected and len(items) < expected:
-            print(f"  ⚠ 作品流只翻到 {len(items)}/{expected}（懒加载卡壳）",
+            log(f"  ⚠ 作品流只翻到 {len(items)}/{expected}（懒加载卡壳）",
                   flush=True)
     finally:
         page.remove_listener("response", on_response)
@@ -843,8 +461,8 @@ def collect_user_posts(sec_uid: str, screenshot_to=None, max_scrolls=120):
     翻页以响应 has_more=0 为准（实测(2026-09)懒加载较慢，需高耐心阈值）。
     """
     with open_browser() as context:
-        page = _first_page(context)
-        ensure_login(context, page)
+        page = first_page(context)
+        ensure_login(context, page, DOUYIN_HOME)
         page.goto(f"https://www.douyin.com/user/{sec_uid}", timeout=30000)
         if screenshot_to:
             try:
@@ -867,71 +485,187 @@ def download_all(items, out_dir: Path):
     total = len(items)
     for i, it in enumerate(items, 1):
         aweme_id, title = it["aweme_id"], it["title"]
-        print(f"\n[{i}/{total}] {title[:30] or aweme_id}")
+        log(f"\n[{i}/{total}] {title[:30] or aweme_id}")
         try:
-            douyin_dl.run(
+            dl_run(
                 f"https://www.douyin.com/video/{aweme_id}", out_dir)
             ok += 1
-        except douyin_dl.ParseError as e:
-            print(f"  跳过: {e}")
+        except ParseError as e:
+            log(f"  跳过: {e}")
             skipped += 1
         except Exception as e:  # noqa: BLE001 - 单条失败不中断批次
-            print(f"  失败: {e}")
+            log(f"  失败: {e}")
             failed_items.append(it)
         if i < total:
             time.sleep(random.uniform(1, 2))
     # 失败补漏：整轮结束后统一再试一轮（多数是分享页风控，缓一缓能过）
     rescued = 0
     if failed_items:
-        print(f"\n--- {len(failed_items)} 条失败，等 10s 后补漏一轮 ---",
+        log(f"\n--- {len(failed_items)} 条失败，等 10s 后补漏一轮 ---",
               flush=True)
         time.sleep(10)
         for it in failed_items:
             try:
-                douyin_dl.run(
+                dl_run(
                     f"https://www.douyin.com/video/{it['aweme_id']}", out_dir)
                 ok += 1
                 rescued += 1
             except Exception as e:  # noqa: BLE001
-                print(f"  仍失败: {e}")
+                log(f"  仍失败: {e}")
                 time.sleep(2)
     failed = len(failed_items) - rescued
-    print(f"\n汇总: 成功 {ok} / 跳过 {skipped} / 失败 {failed}"
+    log(f"\n汇总: 成功 {ok} / 跳过 {skipped} / 失败 {failed}"
           f"（补漏救回 {rescued}）")
     return ok, skipped, failed
 
 
+def _collect_page(context, page, keyword, limit, max_followers=None,
+                  max_duration=None, max_likes=None, seen=None,
+                  block_keywords=None, prefer_jingxuan=False,
+                  min_duration=None):
+    """单个关键词的搜索收集（在已打开的浏览器页签内跳转）。
+
+    成功返回合格列表；验证超时/无数据抛 SearchError（由调用方决定是否继续）。
+    """
+    done = seen if seen is not None else set()
+    seen_local = set()  # 本轮解析去重(不含历史; 已见条目计入 scanned 推进)
+    kept, raw, scanned = [], 0, 0
+    state = {"verify": False, "prompted": False, "prompted_at": 0.0,
+             "reloaded": False}
+
+    def on_response(resp):
+        nonlocal raw, scanned
+        if SEARCH_URL_PREFIX not in resp.url:
+            return
+        try:
+            payload = resp.json()
+        except Exception:
+            return  # 非 JSON / 请求失败
+        if is_verify_block(payload):
+            state["verify"] = True
+            return
+        state["verify"] = False
+        for it in parse_search_response(payload, seen_local):
+            scanned += 1
+            if it["aweme_id"] in done:
+                continue  # 历史/前轮已见: 静默跳过但计入推进
+            raw += 1
+            ok, reason = passes_filter(it, max_followers, max_duration,
+                                       max_likes, min_duration)
+            if ok:
+                bad, kw = author_blocked(it, block_keywords)
+                if bad:
+                    log(f"  跳过: {(it['title'] or it['aweme_id'])[:24]}"
+                          f"（作者黑名单: 简介含「{kw}」）", flush=True)
+                    continue
+                kept.append(it)
+            else:
+                log(f"  跳过: {(it['title'] or it['aweme_id'])[:24]}"
+                      f"（{reason}）", flush=True)
+
+    # 关键：监听器必须在 goto 之前挂上——搜索 XHR 在页面加载瞬间发出
+    page.on("response", on_response)
+    try:
+        # 路由探测：标准 /search/ 12s 内无数据（含 503）→ 换 jingxuan 兜底
+        route = ""
+        for url in _search_urls(keyword, prefer_jingxuan):
+            resp = page.goto(url, timeout=30000)
+            route = url.split("/")[3] or "(根)"
+            status = resp.status if resp else "?"
+            landed = ((resp.url if resp else "?").split("/")[3]
+                      if resp else "?")
+            wait_captcha(page)
+            probe_deadline = time.time() + 12
+            while scanned == 0 and time.time() < probe_deadline:
+                page.wait_for_timeout(1500)
+            if scanned:
+                extra = f"（被跳转到 {landed}）" if landed != route else ""
+                log(f"  (路由 {route} 命中{extra})", flush=True)
+                break
+            log(f"  (路由 {route} 无数据[HTTP {status}]"
+                  f"实际落点 {landed}，切换下一条路由…)", flush=True)
+        # 长等待：等首条有数据的响应；遇软拦截(verify_check)提示用户滑验证。
+        # 提示 90s 后仍无数据则刷新页面重发搜索（验证通过后刷新即可拿到）
+        first_deadline = time.time() + VERIFY_WAIT
+        while scanned == 0 and time.time() < first_deadline:
+            checkpoint()
+            if state["verify"] and not state["prompted"]:
+                urgent(">>> 触发滑块验证：请在浏览器窗口中拖动滑块完成拼图 <<<")
+                state["prompted"] = True
+                state["prompted_at"] = time.time()
+            if (state["prompted"] and not state["reloaded"]
+                    and time.time() - state["prompted_at"] > 90):
+                log("  (刷新页面重新触发搜索…)", flush=True)
+                page.reload(timeout=30000)
+                wait_captcha(page)
+                state["reloaded"] = True
+            page.wait_for_timeout(1500)
+        idle = 0
+        while len(kept) < limit and idle < MAX_IDLE_SCROLLS:
+            checkpoint()
+            before = scanned
+            page.mouse.wheel(0, 2000)
+            page.wait_for_timeout(int(SCROLL_WAIT * 1000))
+            idle = 0 if scanned > before else idle + 1
+    finally:
+        page.remove_listener("response", on_response)
+    if raw == 0:
+        if state["verify"]:
+            raise SearchError(f"[{keyword}] 验证未完成或未通过")
+        raise SearchError(f"[{keyword}] 未拦截到搜索响应：可能改版或风控")
+    log(f"本词合格 {len(kept)} / 共 {raw} 条")
+    return kept[:limit]
+
+
+def collect_many(keywords, limit, max_followers=None, max_duration=None,
+                 max_likes=None, seen=None, block_keywords=None,
+                 prefer_jingxuan=False, min_duration=None):
+    """多关键词聚合：开一次浏览器，逐词收集，全局去重，凑够 limit 即停。
+
+    seen: 额外提供的"已处理 ID 集合"（流水线复用，跳过历史视频）。
+    block_keywords: 作者黑名单关键词（过滤搬运/侵权类账号）。
+    prefer_jingxuan: 精选路由优先。
+    注意：复制入参 set —— 搜索命中的候选 ID 不会污染调用方集合
+    （否则入口候选视频作为剧集分集时会被误判"已处理"而静默跳过）。
+    """
+    seen_ids = set(seen) if seen is not None else set()
+    merged = []
+    with open_browser() as context:
+        page = first_page(context)
+        ensure_login(context, page, DOUYIN_HOME)
+        for idx, kw in enumerate(keywords, 1):
+            if len(merged) >= limit:
+                break
+            remaining = limit - len(merged)
+            log(f"\n=== 关键词 [{idx}/{len(keywords)}] {kw}"
+                  f"（还需 {remaining} 条）===", flush=True)
+            try:
+                merged.extend(_collect_page(context, page, kw, remaining,
+                                            max_followers, max_duration,
+                                            max_likes, seen_ids,
+                                            block_keywords,
+                                            prefer_jingxuan,
+                                            min_duration))
+            except SearchError as e:
+                log(f"  !! {e}，跳到下一个关键词", flush=True)
+            log(f"累计合格 {len(merged)}/{limit}")
+            if idx < len(keywords) and len(merged) < limit:
+                time.sleep(random.uniform(3, 5))  # 词间降温
+    return merged[:limit]
+
+
 # ---------- selftest ----------
 
-def _collect_selftests():
-    return sorted(
-        (name, fn) for name, fn in globals().items()
-        if name.startswith("test_") and callable(fn)
-    )
-
-
 def run_selftests():
-    tests = _collect_selftests()
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(f"  FAIL {name}: {type(e).__name__}: {e}")
-    print(f"selftest: {len(tests) - failed}/{len(tests)} 项通过")
-    return failed == 0
+    return _st.run_selftests(globals())
 
 
 # ---------- tests: 搜索响应解析 ----------
 
 def test_parse_search_response_empty_or_broken():
     assert parse_search_response({}, set()) == []
-    assert parse_search_response({"data": None}, set()) == []
+    assert parse_search_response({"data": None, "aweme_list": None}, set()) == []
 
-
-# ---------- tests: 搜索响应解析 ----------
 
 def test_parse_search_response_aweme_list_shape():
     payload = {"status_code": 0, "aweme_list": [
@@ -970,15 +704,23 @@ def test_parse_search_mix_and_author_fields():
     assert got["sig"] == "简介x" and got["nick"] == "作者B"
 
 
-def test_author_blocked():
-    it = {"sig": "每天更新短剧 禁止搬运", "nick": "xx号", "title": "t"}
-    ok, kw = author_blocked(it, ["搬运"])
-    assert ok is True and kw == "搬运"
-    assert author_blocked(it, ["毫无关系"])[0] is False
-    assert author_blocked(it, None)[0] is False
-    assert author_blocked(it, [])[0] is False
-    clean = {"sig": "原创作者", "nick": "正经营", "title": "无水印"}
-    assert author_blocked(clean, ["搬运", "侵权"])[0] is False
+def test_parse_search_response_carries_sec_uid():
+    payload = {"aweme_list": [{
+        "aweme_id": "111", "desc": "标题A",
+        "author": {"sec_uid": "MS4wABCD", "nickname": "作者B"}}]}
+    got = parse_search_response(payload, set())[0]
+    assert got["sec_uid"] == "MS4wABCD" and got["nick"] == "作者B"
+
+
+def test_parse_search_response_legacy_data_shape():
+    # 兼容旧形态 data[].aweme_info；粉丝回退 mplatform_followers_count
+    payload = {"data": [{"aweme_info": {
+        "aweme_id": "333", "desc": "标题C",
+        "statistics": {"digg_count": 7},
+        "author": {"mplatform_followers_count": 999}}}]}
+    got = parse_search_response(payload, set())
+    assert got[0]["aweme_id"] == "333" and got[0]["digg"] == 7
+    assert got[0]["followers"] == 999 and got[0]["duration_ms"] is None
 
 
 def test_parse_mix_response():
@@ -997,49 +739,6 @@ def test_parse_mix_response():
     assert parse_mix_response(payload, seen) == []
 
 
-def test_looks_continuous():
-    eps_ep = [{"title": "《寻龙》第1集"}, {"title": "《寻龙》第2集"},
-              {"title": "《寻龙》第3集"}]
-    ok, why = looks_continuous(eps_ep)
-    assert ok and "集数标记" in why
-    eps_pre = [{"title": "盛夏光年故事之上"}, {"title": "盛夏光年故事之下"},
-               {"title": "盛夏光年故事番外"}]
-    ok2, why2 = looks_continuous(eps_pre)
-    assert ok2 is True and "前缀" in why2
-    eps_bad = [{"title": "今天吃火锅"}, {"title": "昨天去钓鱼"},
-               {"title": "日常vlog记录"}]
-    ok3, why3 = looks_continuous(eps_bad)
-    assert ok3 is False and "混杂" in why3
-    assert looks_continuous([{"title": "唯一"}])[0] is False
-
-
-def test_sort_episodes_and_prefix():
-    # 有官方集数 → 按集数升序
-    eps = [{"ep": 3, "ct": 1, "aweme_id": "C"},
-           {"ep": 1, "ct": 9, "aweme_id": "A"},
-           {"ep": 2, "ct": 5, "aweme_id": "B"}]
-    assert [e["aweme_id"] for e in sort_episodes(eps)] == ["A", "B", "C"]
-    # 无集数 → 按发布时间升序
-    eps2 = [{"ep": 0, "ct": 30, "aweme_id": "Z"},
-            {"ep": 0, "ct": 10, "aweme_id": "X"},
-            {"ep": 0, "ct": 20, "aweme_id": "Y"}]
-    assert [e["aweme_id"] for e in sort_episodes(eps2)] == ["X", "Y", "Z"]
-    # 前缀零填充：两位数总量补两位，三位补三位
-    assert episode_prefix(7, 34) == "07_"
-    assert episode_prefix(7, 120) == "007_"
-    assert episode_prefix(34, 34) == "34_"
-
-
-# ---------- tests: 主页作品与 series 响应 ----------
-
-def test_parse_search_response_carries_sec_uid():
-    payload = {"aweme_list": [{
-        "aweme_id": "111", "desc": "标题A",
-        "author": {"sec_uid": "MS4wABCD", "nickname": "作者B"}}]}
-    got = parse_search_response(payload, set())[0]
-    assert got["sec_uid"] == "MS4wABCD" and got["nick"] == "作者B"
-
-
 def test_parse_mix_response_series_shape():
     # series/aweme 接口形态(实测 2026-09)：条目精简、无 mix_info/集数字段，
     # 面板顺序即集序，解析须兼容（ep=0，保持原顺序）
@@ -1055,46 +754,18 @@ def test_parse_mix_response_series_shape():
     assert parse_mix_response(payload, seen) == []
 
 
-def test_parse_post_response():
-    payload = {"aweme_list": [
-        {"aweme_id": "111", "desc": "旧作", "create_time": 1779000001,
-         "series_info": {"series_id": 999}},
-        {"aweme_id": "222", "desc": "新作", "create_time": 1779000002,
-         "mix_info": {"mix_id": 555}},
-        {"aweme_id": "111", "desc": "重复"},
-        {"aweme_id": "333", "desc": "无时间"},
-    ]}
-    seen = set()
-    got = parse_post_response(payload, seen)
-    assert got == [
-        {"aweme_id": "111", "title": "旧作", "create_time": 1779000001,
-         "sid": "999"},
-        {"aweme_id": "222", "title": "新作", "create_time": 1779000002,
-         "sid": "555"},
-        {"aweme_id": "333", "title": "无时间", "create_time": 0,
-         "sid": ""},
-    ]
-    assert parse_post_response(payload, seen) == []
-    assert parse_post_response({}, set()) == []
-    # 按所属合集分组
-    sids = {p["sid"] for p in got}
-    assert sids == {"999", "555", ""}
-
-
-def test_parse_search_response_legacy_data_shape():
-    # 兼容旧形态 data[].aweme_info；粉丝回退 mplatform_followers_count
-    payload = {"data": [{"aweme_info": {
-        "aweme_id": "333", "desc": "标题C",
-        "statistics": {"digg_count": 7},
-        "author": {"mplatform_followers_count": 999}}}]}
-    got = parse_search_response(payload, set())
-    assert got[0]["aweme_id"] == "333" and got[0]["digg"] == 7
-    assert got[0]["followers"] == 999 and got[0]["duration_ms"] is None
-
-
-def test_parse_search_response_empty_or_broken():
-    assert parse_search_response({}, set()) == []
-    assert parse_search_response({"data": None, "aweme_list": None}, set()) == []
+def test_sort_episodes():
+    # 有官方集数 → 按集数升序
+    eps = [{"ep": 3, "ct": 1, "aweme_id": "C"},
+           {"ep": 1, "ct": 9, "aweme_id": "A"},
+           {"ep": 2, "ct": 5, "aweme_id": "B"}]
+    assert [e["aweme_id"] for e in sort_episodes(eps)] == ["A", "B", "C"]
+    # 无集数 → 按发布时间升序
+    eps2 = [{"ep": 0, "ct": 30, "aweme_id": "Z"},
+            {"ep": 0, "ct": 10, "aweme_id": "X"},
+            {"ep": 0, "ct": 20, "aweme_id": "Y"}]
+    assert [e["aweme_id"] for e in sort_episodes(eps2)] == ["X", "Y", "Z"]
+    # (episode_prefix 断言已迁 core.naming)
 
 
 def test_is_verify_block():
@@ -1197,61 +868,7 @@ def test_is_paid_aweme_empty_or_invalid():
     assert is_paid_aweme({"aweme_detail": "garbage"}) is False
 
 
-# ---------- tests: 筛选 ----------
-
-def _item(**kw):
-    base = {"aweme_id": "x", "title": "t", "digg": 100,
-            "duration_ms": 60000, "followers": 500}
-    base.update(kw)
-    return base
-
-
-def test_passes_filter_all_pass():
-    ok, why = passes_filter(_item(), max_followers=10000,
-                            max_duration=120, max_likes=1000)
-    assert ok is True and why == ""
-
-
-def test_passes_filter_rejects_each_dimension():
-    assert passes_filter(_item(followers=10000),
-                         max_followers=10000) == (False, "粉丝 10000 >= 10000")
-    assert passes_filter(_item(duration_ms=120000),
-                         max_duration=120) == (False, "时长 120s >= 120s")
-    assert passes_filter(_item(digg=1000),
-                         max_likes=1000) == (False, "点赞 1000 >= 1000")
-
-
-def test_passes_filter_min_duration():
-    ok, _ = passes_filter(_item(duration_ms=31000), min_duration=30)
-    assert ok is True
-    assert passes_filter(_item(duration_ms=30000),
-                         min_duration=30) == (False, "时长 30s <= 30s")
-    assert passes_filter(_item(duration_ms=15000),
-                         min_duration=30)[0] is False
-    assert passes_filter(_item(duration_ms=None),
-                         min_duration=30)[0] is False
-    # 不启用时不受影响
-    assert passes_filter(_item(duration_ms=5000))[0] is True
-
-
-def test_passes_filter_unknown_rejects_only_when_active():
-    assert passes_filter(_item(followers=None), max_followers=100)[0] is False
-    assert passes_filter(_item(digg=None), max_likes=100)[0] is False
-    assert passes_filter(_item(duration_ms=None), max_duration=60)[0] is False
-    assert passes_filter(_item(followers=None, digg=None,
-                               duration_ms=None))[0] is True
-
-
-# ---------- tests: 多关键词 ----------
-
-def test_split_keywords():
-    assert split_keywords("AI 短剧,AI 动画，ai漫剧") == \
-        ["AI 短剧", "AI 动画", "ai漫剧"]
-    assert split_keywords(" 单词 ") == ["单词"]
-    assert split_keywords("a,,b，") == ["a", "b"]
-
-
-# ---------- tests: 日期目录与全局去重 ----------
+# ---------- tests: 接口 URL 与搜索编排 ----------
 
 def test_episode_collection_id():
     assert _episode_collection_id(
@@ -1261,6 +878,17 @@ def test_episode_collection_id():
         "https://www.douyin.com/aweme/v1/web/series/aweme/"
         "?series_id=7312345678901&cursor=10") == "7312345678901"
     assert _episode_collection_id("https://www.douyin.com/other?a=1") is None
+
+
+def test_search_urls_fallback_routes():
+    urls = _search_urls("AI 短剧")
+    assert urls[0] == ("https://www.douyin.com/search/AI%20%E7%9F%AD%E5%89%A7"
+                       "?type=video")
+    assert urls[1] == ("https://www.douyin.com/jingxuan/search/"
+                       "AI%20%E7%9F%AD%E5%89%A7?type=video")
+    # 精选优先时顺序反转
+    jx = _search_urls("AI 短剧", prefer_jingxuan=True)
+    assert jx[0].startswith("https://www.douyin.com/jingxuan/")
 
 
 def test_collect_many_copies_caller_seen():
@@ -1275,7 +903,7 @@ def test_collect_many_copies_caller_seen():
 
     with mock.patch.object(sys.modules[__name__], "_collect_page",
                            fake_collect), \
-         mock.patch.object(sys.modules[__name__], "_first_page",
+         mock.patch.object(sys.modules[__name__], "first_page",
                            return_value=None), \
          mock.patch.object(sys.modules[__name__], "ensure_login",
                            return_value=None), \
@@ -1284,61 +912,6 @@ def test_collect_many_copies_caller_seen():
         collect_many(["词"], 5, seen=caller)
     assert got["seen"] is not caller, "collect 收到的是调用方原集合"
     assert caller == {"X"}, "调用方集合被污染"
-
-
-def test_search_urls_fallback_routes():
-    urls = _search_urls("AI 短剧")
-    assert urls[0] == ("https://www.douyin.com/search/AI%20%E7%9F%AD%E5%89%A7"
-                       "?type=video")
-    assert urls[1] == ("https://www.douyin.com/jingxuan/search/"
-                       "AI%20%E7%9F%AD%E5%89%A7?type=video")
-    # 精选优先时顺序反转
-    jx = _search_urls("AI 短剧", prefer_jingxuan=True)
-    assert jx[0].startswith("https://www.douyin.com/jingxuan/")
-
-
-# ---------- tests: 日期目录与全局去重 ----------
-
-def test_make_dated_dir_same_day_reused():
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-        d1 = make_dated_dir(root)
-        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", d1.name), d1.name
-        # 同一天多次运行 → 同一目录（叠加），不再 -1/-2
-        assert make_dated_dir(root) == d1
-        assert len(list(root.iterdir())) == 1
-
-
-def test_existing_ids_under_recursive():
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-        sub = root / "2026-09-01"
-        (sub / "疑似水印").mkdir(parents=True)
-        (sub / "A_7300000000000000001.mp4").write_bytes(b"x")
-        (sub / "疑似水印" / "B_7300000000000000002.mp4").write_bytes(b"x")
-        (root / "C_7300000000000000003.mp4").write_bytes(b"x")
-        assert existing_ids_under(root) == {
-            "7300000000000000001", "7300000000000000002",
-            "7300000000000000003"}
-
-
-# ---------- tests: 登录判定与目录名 ----------
-
-def test_has_login_true_only_with_sessionid_value():
-    assert has_login([{"name": "sessionid", "value": "abc"}]) is True
-    assert has_login([{"name": "sessionid", "value": ""}]) is False
-    assert has_login([{"name": "ttwid", "value": "x"}]) is False
-    assert has_login([]) is False
-
-
-def test_safe_dir_name():
-    assert safe_dir_name("AI 短剧") == "AI 短剧"
-    # ? 和 " 相邻 → 各替换为一个空格 → 两个连续空格
-    assert safe_dir_name('a/b:c*d?"e<f>g|h') == "a b c d  e f g h"
-    assert safe_dir_name("  ") == ""
-    assert len(safe_dir_name("长" * 80)) == 50
 
 
 def main(argv=None):
@@ -1365,16 +938,16 @@ def main(argv=None):
         sys.exit(0 if run_selftests() else 1)
     try:
         if args.login:
-            login_only()
+            login_only(DOUYIN_HOME)
             return
         if not args.keyword:
             parser.error("请提供搜索关键词")
         keywords = split_keywords(args.keyword)
         out_dir = make_dated_dir(DOWNLOADS_DIR)
-        print(f"输出目录: {out_dir}")
+        log(f"输出目录: {out_dir}")
         filters = (args.max_followers, args.max_duration, args.max_likes)
         if any(v is not None for v in filters):
-            print(f"筛选: 粉丝<{args.max_followers or '∞'} "
+            log(f"筛选: 粉丝<{args.max_followers or '∞'} "
                   f"时长<{args.max_duration or '∞'}s "
                   f"赞<{args.max_likes or '∞'}")
         # 跨目录全局去重：历史所有已下载视频不再收集
@@ -1385,12 +958,12 @@ def main(argv=None):
             block_kw = split_keywords(args.block_keywords)
         items = collect_many(keywords, args.limit, *filters, seen=seen0,
                              block_keywords=block_kw)
-        print(f"搜索到 {len(items)} 条（目标 {args.limit}）")
+        log(f"搜索到 {len(items)} 条（目标 {args.limit}）")
         if len(items) < args.limit:
-            print("提示：结果不足 limit，下载已拿到的条目")
+            log("提示：结果不足 limit，下载已拿到的条目")
         download_all(items, out_dir)
     except SearchError as e:
-        print(f"错误: {e}", file=sys.stderr)
+        log(f"错误: {e}", err=True)
         sys.exit(1)
 
 

@@ -1,0 +1,4 @@
+# 运行依赖（打包机另需: pyinstaller>=6.0）
+requests>=2.32
+playwright>=1.62
+pywebview>=6.2

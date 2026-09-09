@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""douyin_dl.py — 抖音单条无水印视频下载器
+"""platforms.douyin.dl — 抖音单条无水印视频下载
+链接提取 / 分享页 _ROUTER_DATA 解析 / 浏览器兜底路线 / 下载编排。
 仅限个人离线保存；请尊重创作者版权，勿去水印二次上传。
+
+（原 douyin_dl.py 的抖音专属部分，HTTP 引擎/命名/清单已在 core）
 """
 import argparse
 import json
@@ -12,38 +15,16 @@ from pathlib import Path
 
 import requests
 
-IPHONE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-)
-TIMEOUT = 10
-RETRIES = 2
-SCRIPT_DIR = Path(__file__).resolve().parent
-BROWSER_PROFILE_DIR = SCRIPT_DIR / ".browser-profile"
-DETAIL_SUBSTR = "/aweme/v1/web/aweme/detail/"
-# web CDN 直链需要的请求头（实测 2026-09：无 Referer 会 403）
-WEB_HEADERS = {
-    "Referer": "https://www.douyin.com/",
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/131.0.0.0 Safari/537.36"),
-}
+from core import bootstrap
+from core import paths
+from core.reporting import log, urgent
+from core import selftest as _st
+from core.download import (IPHONE_UA, ParseError, WEB_HEADERS, download_video,
+                           http_get_with_retry)
+from core.naming import build_filename, record_manifest
+from .config import DETAIL_SUBSTR
 
-
-class ParseError(Exception):
-    """解析失败（链接无效 / 页面结构变更 / 触发风控等）。"""
-
-
-def is_conn_dead(e) -> bool:
-    """判定异常是否为浏览器/driver 断连（整个浏览器崩溃或被关）。
-
-    区别于单页签被关（Tab Discard，工厂可自愈）：断连后所有页面操作
-    都会失败，调用方应停止本轮而非逐条空烧。
-    """
-    s = str(e)
-    return ("Connection closed" in s
-            or "Browser has been closed" in s
-            or "Target page, context or browser has been closed" in s)
+BROWSER_PROFILE_DIR = paths.PROFILE_DIR  # 与合集模式共用主登录态
 
 
 # ---------- 链接提取 ----------
@@ -131,116 +112,6 @@ def parse_item(item: dict) -> dict:
     raise ParseError("item 中没有 video.play_addr.url_list")
 
 
-def record_manifest(out_dir: Path, filename: str, title: str, author: str,
-                    mix_name: str = "", vid: str = "") -> None:
-    """登记视频元信息（作者/短剧名/标题）到 视频清单.json + .csv。
-
-    按文件名去重，重复调用不产生重复行；CSV 用 UTF-8-BOM，Excel 直接可开。
-    """
-    mf = out_dir / "视频清单.json"
-    data = {}
-    if mf.exists():
-        try:
-            data = json.loads(mf.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    if filename in data:
-        return
-    data[filename] = {"time": time.strftime("%Y-%m-%d %H:%M"),
-                      "author": author or "", "mix": mix_name or "",
-                      "title": title or "", "vid": vid or ""}
-    mf.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                  encoding="utf-8")
-    with open(out_dir / "视频清单.csv", "w", encoding="utf-8-sig",
-              newline="") as f:
-        f.write("下载时间,作者,短剧名,标题,文件名,视频ID\n")
-        for fn, m in data.items():
-            row = [m["time"], m["author"], m["mix"], m["title"], fn,
-                   m["vid"]]
-            f.write(",".join('"' + str(c).replace('"', '""') + '"'
-                             for c in row) + "\n")
-
-
-# ---------- 文件名 ----------
-
-INVALID_FN_RE = re.compile(r'[\\/:*?"<>|\r\n]')
-
-
-HASHTAG_RE = re.compile(r"#[^\s#]+")
-
-
-def build_filename(title: str, aweme_id: str, author: str = "") -> str:
-    """标题去话题标签+清洗+截断50字，附 来源@作者；ID 恒在末尾。
-
-    形如: 标题_来源@作者_ID.mp4；无作者: 标题_ID.mp4；空标题回退纯 ID。
-    话题标签(#xxx)整体剔除；连续空白折叠为单空格。
-    """
-    t = HASHTAG_RE.sub("", title or "")
-    clean = INVALID_FN_RE.sub(" ", t)
-    clean = re.sub(r"\s+", " ", clean).strip()[:50].strip()
-    nick = INVALID_FN_RE.sub(" ", author or "").strip()[:24].strip()
-    if not clean:
-        clean = nick.lstrip("@")
-        nick = ""
-    parts = [p for p in (clean, f"来源@{nick}" if nick else "",
-                         str(aweme_id)) if p]
-    return "_".join(parts) + ".mp4"
-
-
-# ---------- 网络层 ----------
-
-def http_get_with_retry(session, url, stream=False, headers=None):
-    """GET，10s 超时，自动重试 RETRIES 次；最终失败抛最后一个异常。"""
-    last_exc = None
-    for attempt in range(RETRIES + 1):
-        try:
-            r = session.get(url, timeout=TIMEOUT, stream=stream,
-                            headers=headers)
-            r.raise_for_status()
-            return r
-        except requests.RequestException as e:
-            last_exc = e
-            if attempt < RETRIES:
-                time.sleep(1.5 * (attempt + 1))
-    raise last_exc
-
-
-def download_video(session, url, dest: Path, headers=None) -> None:
-    """流式下载到 dest；断流/异常/过小内容自动整档重试(RETRIES+1 次)。
-
-    实测(2026-09-05): web CDN 直链下长视频(50MB+)中途断流常见
-    (ChunkedEncodingError——GET 层的重试只覆盖建连，管不到流中途)，
-    单次尝试失败率可观，整档重试即可恢复。半成品每轮清理。
-    """
-    last_exc = None
-    for attempt in range(RETRIES + 1):
-        dest.unlink(missing_ok=True)  # 清上轮半成品，避免幂等误判
-        r = None
-        try:
-            r = http_get_with_retry(session, url, stream=True,
-                                    headers=headers)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            total = 0
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        total += len(chunk)
-            if total < 1024:
-                raise ParseError(f"下载内容异常（仅 {total} 字节），"
-                                 f"链接可能已失效")
-            return
-        except Exception as e:  # noqa: BLE001 - 断流/超时/过小统一重试
-            last_exc = e
-            if attempt < RETRIES:
-                time.sleep(1.5 * (attempt + 1))
-        finally:
-            if r is not None:
-                r.close()
-    dest.unlink(missing_ok=True)  # 最终失败也清半成品（循环顶只清下一轮）
-    raise last_exc
-
-
 # ---------- 浏览器兜底路线（分享页被风控时使用） ----------
 
 def _capture_detail(resp, got):
@@ -324,7 +195,7 @@ def resolve_via_browser(aweme_id: str, page=None) -> dict:
             "pip install playwright && playwright install chromium")
     if not BROWSER_PROFILE_DIR.exists():
         raise ParseError("分享页被风控且无浏览器登录态，"
-                         "请先运行: python douyin_search.py --login")
+                         "请先运行: python run.py login")
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(BROWSER_PROFILE_DIR), headless=True,
@@ -344,31 +215,31 @@ def _via_browser(s, aweme_id: str, out_dir: Path, name_prefix: str,
     用于：分享页被风控拿不到数据；分享页直链失效(如 404，付费/受限内容)。
     page: 页或页工厂（流式 worker 页），避免嵌套 sync_playwright 崩溃。
     """
-    print("  (切换浏览器兜底路线…)", flush=True)
+    log("  (切换浏览器兜底路线…)", flush=True)
     fb = resolve_via_browser(aweme_id, page=page)
     dest = out_dir / (name_prefix + build_filename(fb["title"], aweme_id,
                                                     fb.get("author", "")))
     if dest.exists():
-        print(f"已存在，跳过: {dest}")
+        log(f"已存在，跳过: {dest}")
         record_manifest(out_dir, dest.name, fb["title"], fb["author"],
                         fb.get("mix_name", ""), aweme_id)
         return dest
-    print(f"标题: {fb['title'] or '(无)'}")
-    print(f"作者: {fb['author'] or '(未知)'}")
-    print("下载中…")
+    log(f"标题: {fb['title'] or '(无)'}")
+    log(f"作者: {fb['author'] or '(未知)'}")
+    log("下载中…")
     last_exc = None
     for i, u in enumerate(fb["urls"], 1):
         try:
             download_video(s, u, dest, headers=WEB_HEADERS)
             break
         except Exception as e:  # noqa: BLE001 - 逐个直链尝试
-            print(f"  (直链{i}失败: {type(e).__name__}: {e})", flush=True)
+            log(f"  (直链{i}失败: {type(e).__name__}: {e})", flush=True)
             last_exc = e
     else:
         raise last_exc or ParseError("兜底路线下载失败")
     record_manifest(out_dir, dest.name, fb["title"], fb["author"],
                     fb.get("mix_name", ""), aweme_id)
-    print(f"已保存: {dest}")
+    log(f"已保存: {dest}")
     return dest
 
 
@@ -407,7 +278,7 @@ def run(text: str, out_dir: Path, name_prefix: str = "",
                 time.sleep(0.8)
         if item is None:
             # 分享页被风控 → 浏览器兜底路线
-            print("  (分享页被风控)", flush=True)
+            log("  (分享页被风控)", flush=True)
             return _via_browser(s, aweme_id, out_dir, name_prefix,
                                 page=fallback_page)
         info = parse_item(item)
@@ -415,48 +286,31 @@ def run(text: str, out_dir: Path, name_prefix: str = "",
                           build_filename(info["title"], aweme_id,
                                          info.get("author", "")))
         if dest.exists():
-            print(f"已存在，跳过: {dest}")
+            log(f"已存在，跳过: {dest}")
             record_manifest(out_dir, dest.name, info["title"],
                             info["author"], info.get("mix_name", ""),
                             aweme_id)
             return dest
-        print(f"标题: {info['title'] or '(无)'}")
-        print(f"作者: {info['author'] or '(未知)'}")
-        print("下载中…")
+        log(f"标题: {info['title'] or '(无)'}")
+        log(f"作者: {info['author'] or '(未知)'}")
+        log("下载中…")
         try:
             download_video(s, info["no_wm_url"], dest)
         except Exception as e:  # noqa: BLE001 - 直链失效(如404)也走兜底
-            print(f"  (分享页直链失败: {type(e).__name__}，尝试浏览器兜底)",
+            log(f"  (分享页直链失败: {type(e).__name__}，尝试浏览器兜底)",
                   flush=True)
             return _via_browser(s, aweme_id, out_dir, name_prefix,
                                 page=fallback_page)
     record_manifest(out_dir, dest.name, info["title"], info["author"],
                     info.get("mix_name", ""), aweme_id)
-    print(f"已保存: {dest}")
+    log(f"已保存: {dest}")
     return dest
 
 
 # ---------- selftest ----------
 
-def _collect_selftests():
-    return sorted(
-        (name, fn) for name, fn in globals().items()
-        if name.startswith("test_") and callable(fn)
-    )
-
-
 def run_selftests():
-    tests = _collect_selftests()
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS {name}")
-        except Exception as e:  # noqa: BLE001 - selftest 要抓住一切
-            failed += 1
-            print(f"  FAIL {name}: {type(e).__name__}: {e}")
-    print(f"selftest: {len(tests) - failed}/{len(tests)} 项通过")
-    return failed == 0
+    return _st.run_selftests(globals())
 
 
 # ---------- tests: 链接提取 ----------
@@ -593,7 +447,7 @@ def test_parse_item_no_play_addr_raises():
         pass
 
 
-# ---------- tests: 文件名清洗 ----------
+# ---------- tests: 其他 ----------
 
 def test_parse_item_mix_name():
     item = {"desc": "t", "author": {"nickname": "a",
@@ -605,66 +459,12 @@ def test_parse_item_mix_name():
     assert parse_item(top)["mix_name"] == "顶层合集"
 
 
-def test_record_manifest_no_dup_and_csv():
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        record_manifest(d, "a.mp4", "标题A", "作者X", "剧Z", "1" * 19)
-        record_manifest(d, "a.mp4", "重复不写", "重复", "", "1" * 19)
-        record_manifest(d, "b.mp4", '含"引号"的标题', "作者Y", "", "2" * 19)
-        j = json.loads((d / "视频清单.json").read_text(encoding="utf-8"))
-        assert len(j) == 2 and j["a.mp4"]["author"] == "作者X"
-        csv_text = (d / "视频清单.csv").read_text(encoding="utf-8-sig")
-        assert "作者X" in csv_text and "剧Z" in csv_text
-        assert "重复不写" not in csv_text
-        assert csv_text.count("\n") == 3  # 表头 + 2 行
-
-def test_build_filename_cleans_and_truncates():
-    title = '好"视频:/<标题>|续\n第二行' + "长" * 80
-    name = build_filename(title, "7300000000000000000")
-    for ch in '\\/:*?"<>|\r\n':
-        assert ch not in name, f"非法字符 {ch!r} 残留"
-    assert len(name) < 80, "应当截断标题"
-    assert name.endswith("_7300000000000000000.mp4")
-
-
-def test_build_filename_keeps_normal_title():
-    assert build_filename("普通的标题", "123") == "普通的标题_123.mp4"
-
-
-def test_build_filename_with_author():
-    assert build_filename("标题A", "123", "阿刀Al短剧") == \
-        "标题A_来源@阿刀Al短剧_123.mp4"
-    # 作者名清洗非法字符；ID 恒在末尾
-    assert build_filename('t"t', "456", '作/者:名') == \
-        't t_来源@作 者 名_456.mp4'
-    # 空标题时用作者名兜底（作标题，不带来源@）
-    assert build_filename("", "789", "某人") == "某人_789.mp4"
-
-
-def test_build_filename_strips_hashtags():
-    # 话题标签整体剔除，多余空白折叠
-    assert build_filename(
-        "好看 #AI短剧 #ai漫剧 #抖音ai创作大赛", "1", "作者X") == \
-        "好看_来源@作者X_1.mp4"
-    assert build_filename("纯话题 #只有标签", "2") == "纯话题_2.mp4"
-    # 孤立 # 不构成话题标签，保留；有效标签(#中、#后)剔除
-    assert build_filename("前#中##后 续", "3") == "前# 续_3.mp4"
-
-
-def test_build_filename_fallback_id_only():
-    assert build_filename("", "1234567890123456789") == \
-        "1234567890123456789.mp4"
-    assert build_filename("   ", "1234567890123456789") == \
-        "1234567890123456789.mp4"
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="抖音单条无水印视频下载器（仅限个人保存）")
     parser.add_argument("text", nargs="?", help="含抖音分享链接/口令的任意文本")
     parser.add_argument("-o", "--out-dir", default=None,
-                        help="输出目录（默认: 脚本目录/downloads）")
+                        help="输出目录（默认: 应用根/downloads）")
     parser.add_argument("--selftest", action="store_true",
                         help="运行内置自测（不联网）")
     args = parser.parse_args(argv)
@@ -672,17 +472,14 @@ def main(argv=None):
         sys.exit(0 if run_selftests() else 1)
     text = args.text if args.text is not None else \
         input("粘贴抖音分享口令/链接: ").strip()
-    out_dir = Path(args.out_dir) if args.out_dir else \
-        Path(__file__).resolve().parent / "downloads"
+    out_dir = Path(args.out_dir) if args.out_dir else paths.DOWNLOADS_DIR
     try:
         run(text, out_dir)
     except (ParseError, requests.RequestException, OSError) as e:
-        print(f"错误: {e}", file=sys.stderr)
+        log(f"错误: {e}", err=True)
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+    bootstrap.setup_stdio()
     main()

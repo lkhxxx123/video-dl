@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""series_detect.py — 作者主页剧集识别（合集/系列接口都拿不到时的兜底）
+"""platforms.douyin.series — 抖音剧集识别（合集/系列接口拿不到时的兜底）
 
 两层判定：
 1. episode_hint(): 标题集数标记正则（便宜，只做"是否值得深入看主页"的门控）；
-2. judge_series(): 把主页全部作品标题(+主页截图)交给 qwen 判定哪些属于目标视频
-   的同一部系列，返回 ID 子集（只下载子集，防止把作者日常视频误全下）。
+2. judge_series(): 把主页全部作品标题(+主页截图)交给 VLM 判定哪些属于目标
+   视频的同一部系列，返回 ID 子集（只下载子集，防止把作者日常视频误全下）。
+另含 looks_continuous(): 合集标题连续性判定（原 douyin_search，依赖
+episode_hint，语义属剧集判定故随迁）。
 """
 import base64
 import json
@@ -14,6 +16,9 @@ import sys
 import time
 
 import requests
+
+from core.reporting import log, urgent
+from core import selftest as _st
 
 RETRIES = 2
 
@@ -64,6 +69,26 @@ def episode_hint(title: str):
     return None
 
 
+def looks_continuous(eps):
+    """合集标题是否像同一部连续剧集（防"杂物合集"误下整部）。
+
+    判据（满足其一）：≥2 个标题带集数标记；或 ≥60% 标题共享前 6 字前缀。
+    返回 (是否连续, 依据说明)。
+    """
+    titles = [(e.get("title") or "").strip() for e in eps]
+    titles = [t.split("#")[0].strip() or t for t in titles]  # 去话题标签
+    if len(titles) < 2:
+        return False, "集数不足 2"
+    hint = sum(1 for t in titles if episode_hint(t))
+    if hint >= 2:
+        return True, f"{hint} 个标题带集数标记"
+    prefix = titles[0][:6]
+    same = sum(1 for t in titles if t[:6] == prefix)
+    if same >= max(2, len(titles) * 0.6):
+        return True, f"{same}/{len(titles)} 标题共享前缀「{prefix}」"
+    return False, "标题混杂（无集数标记也无共同前缀）"
+
+
 # ---------- 纯逻辑：判定结果校验 ----------
 
 def validate_series_verdict(verdict: dict, items: list, target_id: str) -> dict:
@@ -91,7 +116,7 @@ def validate_series_verdict(verdict: dict, items: list, target_id: str) -> dict:
             "reason": verdict.get("reason", "")}
 
 
-# ---------- Qwen 调用 ----------
+# ---------- VLM 调用 ----------
 
 SERIES_PROMPT = """你是短视频编目助手。用户从抖音选中了一条目标视频，下面给出目标视频信息
 和该作者主页的作品列表(按发布时间升序，每行格式: 序号|发布日期|标题|视频ID，
@@ -134,7 +159,7 @@ def _fmt_items(items: list, target_id: str, target_title: str) -> str:
 
 def judge_series(target_id: str, target_title: str, items: list, screenshot,
                  api_key: str, base_url: str, model: str) -> dict:
-    """主页作品列表(+可选截图) → qwen 判定同系列 ID 子集。
+    """主页作品列表(+可选截图) → VLM 判定同系列 ID 子集。
 
     items: [{aweme_id,title,create_time}]；screenshot: 截图 Path 或 None。
     返回经 validate_series_verdict 清洗后的判定 dict。
@@ -168,25 +193,8 @@ def judge_series(target_id: str, target_title: str, items: list, screenshot,
 
 # ---------- selftest ----------
 
-def _collect_selftests():
-    return sorted(
-        (name, fn) for name, fn in globals().items()
-        if name.startswith("test_") and callable(fn)
-    )
-
-
 def run_selftests():
-    tests = _collect_selftests()
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(f"  FAIL {name}: {type(e).__name__}: {e}")
-    print(f"selftest: {len(tests) - failed}/{len(tests)} 项通过")
-    return failed == 0
+    return _st.run_selftests(globals())
 
 
 def test_cn_to_int():
@@ -265,12 +273,28 @@ def test_validate_target_absent_from_items():
     assert v["is_series"] and v["ids"] == ["A", "B"]
 
 
+def test_looks_continuous():
+    eps_ep = [{"title": "《寻龙》第1集"}, {"title": "《寻龙》第2集"},
+              {"title": "《寻龙》第3集"}]
+    ok, why = looks_continuous(eps_ep)
+    assert ok and "集数标记" in why
+    eps_pre = [{"title": "盛夏光年故事之上"}, {"title": "盛夏光年故事之下"},
+               {"title": "盛夏光年故事番外"}]
+    ok2, why2 = looks_continuous(eps_pre)
+    assert ok2 is True and "前缀" in why2
+    eps_bad = [{"title": "今天吃火锅"}, {"title": "昨天去钓鱼"},
+               {"title": "日常vlog记录"}]
+    ok3, why3 = looks_continuous(eps_bad)
+    assert ok3 is False and "混杂" in why3
+    assert looks_continuous([{"title": "唯一"}])[0] is False
+
+
 def main(argv=None):  # pragma: no cover - 手动自测入口
     if argv is None:
         argv = sys.argv[1:]
     if "--selftest" in argv:
         sys.exit(0 if run_selftests() else 1)
-    print(__doc__)
+    log(__doc__)
 
 
 if __name__ == "__main__":

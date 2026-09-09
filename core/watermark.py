@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""watermark_filter.py — AI 检测视频中的作者自加水印并分流
+"""core.watermark — AI 检测视频中的作者自加水印并分流（平台无关）。
+
+原 watermark_filter.py 整体迁入，并收编 douyin_auto.judge_file
+（合集/散片两模式共用的"抽帧→判定→清理"封装）。
 判定非 100% 准确：仅转移不删除，建议先 --dry-run 预览。
 """
 import argparse
@@ -16,10 +19,17 @@ from pathlib import Path
 
 import requests
 
+from .reporting import log
+from .paths import find_tool
+from . import selftest as _st
+
 DEFAULT_MODEL = "MiniMax-M3"
 DEFAULT_BASE_URL = "https://api.minimaxi.com/anthropic"
-FRAME_WIDTH = 640
+FRAME_WIDTH = 960   # 640 时顶部半透明小字水印(如 @作者名 新剧xxx)易看不清导致漏检
 RETRIES = 2
+
+# 抽帧子进程不弹终端窗口(Windows); 其他平台无此常量传 0
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 class FilterError(Exception):
@@ -67,9 +77,10 @@ def unique_dest(path: Path) -> Path:
 
 def probe_duration(video: Path) -> float:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [find_tool("ffprobe"), "-v", "error", "-show_entries",
+         "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW,
         encoding="utf-8", errors="replace")
     if out.returncode != 0:
         raise FilterError(f"ffprobe 失败: {out.stderr.strip()[:100]}")
@@ -84,34 +95,61 @@ def extract_frames(video: Path, n: int, workdir: Path):
     for i, t in enumerate(ts):
         out = workdir / f"{video.stem[:60]}_f{i}.jpg"
         r = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t),
+            [find_tool("ffmpeg"), "-y", "-loglevel", "error",
+             "-strict", "unofficial",
+             "-ss", str(t),
              "-i", str(video), "-frames:v", "1",
              "-vf", f"scale={FRAME_WIDTH}:-2", str(out)],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW,
             encoding="utf-8", errors="replace")
+        # -strict unofficial: 部分视频为 Non full-range YUV, 严格模式转
+        # mjpeg 直接报错 → 6 帧全失败 → 识图流程整体跳过(漏检)
         if r.returncode == 0 and out.exists():
             frames.append(out)
     return frames
 
 
-# ---------- Qwen-VL 调用 ----------
+# ---------- VLM 调用 ----------
 
 PROMPT = """你是视频水印审核员。下面是同一个视频按时间顺序抽取的{N}帧截图（第1张最早）。
-找出视频中"叠加标识元素"并分类：
-- account（账号/引流类）：作者账号名、抖音号、公众号、"感谢关注/求关注"类
-  引流文字、作者半透明 logo。位置固定或移动都算。
-- platform（平台标识类）：任何第三方平台的叠加标识——抖音（角标/logo/
-  @抖音小助手/DOU+）、快手、微博（含@微博）、小红书（含小红书号）、
-  B站/哔哩哔哩、视频号、TikTok、西瓜视频、今日头条等——【都算水印，需转移】。
-- ai_label（AI标识类）："AI生成"、"内容由AI生成"、"豆包AI生成"等 AI 内容
-  标注，属内容属性说明，【不算水印】。
-- title（标题花字类）：作者叠加的标题、吐槽花字（如黄色描边文案），
-  属内容装饰，【不算水印】。
-以下同样不算水印：进度条等播放器 UI、底部居中硬字幕、画面场景内自然文字
-（招牌/手机屏幕/片头标题动画）。
-判定规则：存在 account 或 platform 类元素时 has_author_watermark 为 true。
+任务：判断视频中是否存在【当前发布作者自己添加的账号标识/引流元素】。
+
+只有以下情况算水印（has_author_watermark = true）：
+- 当前作者的账号名/昵称/抖音号/微信号/公众号名，以角标、水印文字、
+  半透明 logo 形式叠加在画面上（位置固定或移动都算）
+- 当前作者添加的引流文字/贴纸："感谢关注""求关注""关注看下集"等
+
+以下一律不算水印（has_author_watermark = false）：
+- 抖音/快手/西瓜等任何平台的角标、logo、@用户名角标——平台自动添加的
+- 影视剧/综艺/素材自带的台标、字幕组标识、原视频遗留水印（搬运内容里
+  看到的别人水印不是当前作者添加的）
+- 剧名 logo、片头片尾标题花字、演员表、剧集自制标识
+- "AI生成"等 AI 内容标注
+- 进度条等播放器 UI、底部居中硬字幕、画面场景内自然文字（招牌/手机屏幕）
+
+判定原则：
+- 核心区分：标识是否【指向当前发布作者本人/其账号】。指向别处的
+  （平台、原片方、他人）都不算
+- 重点检查画面顶部/四角的【半透明文字水印】——短剧最常见的形态就是
+  顶部一行"@作者名 新剧「剧名」"样式的浅色小字，对比度低但持续存在，
+  这类必须判 true
+- 水印可能间歇出现（淡入淡出/移动）或每帧位置不同，只要任意一帧出现
+  即算；位置移动不影响判定
+- 与发布作者昵称相关的水印（一致/包含其主体词）不属于"拿不准"，
+  必须判 true；拿不准仅适用于与发布者无关的场合
+
+{AUTHOR}
 严格只输出 JSON（不要任何多余文字）：
-{{"has_author_watermark": true或false, "type": "account或platform或ai_label或title或空", "moving": true或false, "desc": "简述依据", "frames_with_watermark": [帧序号,从1开始]}}"""
+{{"has_author_watermark": true或false, "type": "account或空", "moving": true或false, "desc": "简述依据", "frames_with_watermark": [帧序号,从1开始]}}"""
+
+
+def _author_block(author: str) -> str:
+    """作者信息块: 传入发布者昵称时给 VLM 提供比对基准(漏检的关键)。"""
+    if not author:
+        return "【发布作者昵称】未提供——仅当水印明显是账号名样式且无相反证据时判 true。\n"
+    return (f"【发布作者昵称】「{author}」\n"
+            f"若画面水印文字与该昵称相关（完全一致/包含其主体词/同一主体"
+            f"如简称），即为当前作者自己的账号标识，必须判 true。\n")
 
 
 def _anthropic_messages_url(base_url: str) -> str:
@@ -130,12 +168,16 @@ def _anthropic_text(data: dict) -> str:
                    if isinstance(b, dict))
 
 
-def ask_vlm(frames, api_key: str, base_url: str, model: str) -> dict:
+def ask_vlm(frames, api_key: str, base_url: str, model: str,
+            author: str = "") -> dict:
     """多帧一次调用，返回判定 dict；解析失败/HTTP 失败重试。
 
+    author: 发布作者昵称——传给 VLM 作水印归属比对基准（缺失时
+    VLM 无法确认水印归属，是漏检的主因）。
     自动分协议：base_url 含 /anthropic → Anthropic Messages 格式
     （MiniMax M3 等走此协议）；否则 OpenAI chat/completions 格式。
     """
+    author_block = _author_block(author)
     is_anthropic = "/anthropic" in base_url
     if is_anthropic:
         content = []
@@ -146,7 +188,8 @@ def ask_vlm(frames, api_key: str, base_url: str, model: str) -> dict:
                                        "media_type": "image/jpeg",
                                        "data": b64}})
         content.append({"type": "text",
-                        "text": PROMPT.format(N=len(frames))})
+                        "text": PROMPT.format(N=len(frames),
+                                              AUTHOR=author_block)})
         body = {"model": model, "max_tokens": 1024,
                 "messages": [{"role": "user", "content": content}]}
         url = _anthropic_messages_url(base_url)
@@ -164,7 +207,9 @@ def ask_vlm(frames, api_key: str, base_url: str, model: str) -> dict:
             content.append({"type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{b64}"}})
-        content.append({"type": "text", "text": PROMPT.format(N=len(frames))})
+        content.append({"type": "text",
+                        "text": PROMPT.format(N=len(frames),
+                                              AUTHOR=author_block)})
         body = {"model": model,
                 "messages": [{"role": "user", "content": content}]}
         url = base_url.rstrip("/")
@@ -186,6 +231,28 @@ def ask_vlm(frames, api_key: str, base_url: str, model: str) -> dict:
     raise last_exc
 
 
+# ---------- 判定封装（原 douyin_auto.judge_file，两模式共用） ----------
+
+def judge_file(video: Path, api_key, base_url, model, frames_n,
+               workdir: Path, author: str = "") -> dict:
+    """抽帧 → VLM 判定单条视频水印；判定完即清理抽帧 jpg。
+
+    author: 发布作者昵称（水印归属比对基准，见 ask_vlm）。
+    通宵跑几千条会无限累积占盘，故判定与清理绑定在 finally。
+    """
+    frames = extract_frames(video, frames_n, workdir)
+    if not frames:
+        raise FilterError("抽帧失败（视频损坏？）")
+    try:
+        return ask_vlm(frames, api_key, base_url, model, author=author)
+    finally:
+        for f in frames:
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 # ---------- 编排 ----------
 
 def run(video_dir: Path, n_frames: int, api_key: str, base_url: str,
@@ -198,7 +265,7 @@ def run(video_dir: Path, n_frames: int, api_key: str, base_url: str,
         for f in list(quarantine.glob("*.mp4")):
             shutil.move(str(f), str(unique_dest(video_dir / f.name)))
             rescued += 1
-        print(f"[rejudge] 已移回 {rescued} 个待重判文件")
+        log(f"[rejudge] 已移回 {rescued} 个待重判文件")
         videos = sorted(video_dir.glob("*.mp4"))
     if not videos:
         raise FilterError(f"目录中没有 mp4: {video_dir}")
@@ -206,21 +273,24 @@ def run(video_dir: Path, n_frames: int, api_key: str, base_url: str,
     workdir.mkdir(exist_ok=True)
     report = []
     for idx, v in enumerate(videos, 1):
-        print(f"\n[{idx}/{len(videos)}] {v.name[:40]}")
+        log(f"\n[{idx}/{len(videos)}] {v.name[:40]}")
         entry = {"file": v.name, "status": "error", "reason": ""}
         try:
             frames = extract_frames(v, n_frames, workdir)
             if not frames:
                 entry["reason"] = "抽帧失败"
-                print("  错误: 抽帧失败")
+                log("  错误: 抽帧失败")
                 report.append(entry)
                 continue
-            verdict = ask_vlm(frames, api_key, base_url, model)
+            # 文件名尾部带 来源@作者 → 作水印归属比对基准
+            m = re.search(r"_来源@(.+?)_\d{15,}", v.name)
+            author = m.group(1) if m else ""
+            verdict = ask_vlm(frames, api_key, base_url, model, author=author)
             entry.update(verdict)
             if verdict.get("has_author_watermark"):
                 if dry_run:
                     entry["status"] = "flagged(dry-run)"
-                    print(f"  ⚠ 有作者水印（dry-run 不转移）: "
+                    log(f"  ⚠ 有作者水印（dry-run 不转移）: "
                           f"{verdict.get('desc', '')[:50]}")
                 else:
                     quarantine.mkdir(exist_ok=True)
@@ -228,45 +298,29 @@ def run(video_dir: Path, n_frames: int, api_key: str, base_url: str,
                     shutil.move(str(v), str(dest))
                     entry["status"] = "moved"
                     entry["moved_to"] = dest.name
-                    print(f"  ⚠ 有作者水印 → 已转移: "
+                    log(f"  ⚠ 有作者水印 → 已转移: "
                           f"{verdict.get('desc', '')[:50]}")
             else:
                 entry["status"] = "clean"
-                print("  ✓ 无作者水印")
+                log("  ✓ 无作者水印")
         except Exception as e:  # noqa: BLE001 - 单条失败不中断
             entry["reason"] = f"{type(e).__name__}: {e}"
-            print(f"  错误: {entry['reason']}")
+            log(f"  错误: {entry['reason']}")
         report.append(entry)
     (video_dir / "watermark_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     n_clean = sum(1 for e in report if e["status"] == "clean")
-    n_moved = sum(1 for e in report if e["status"] in ("moved", "flagged(dry-run)"))
+    n_moved = sum(1 for e in report
+                  if e["status"] in ("moved", "flagged(dry-run)"))
     n_err = sum(1 for e in report if e["status"] == "error")
-    print(f"\n汇总: 无水印 {n_clean} / 有水印 {n_moved} / 错误 {n_err}"
+    log(f"\n汇总: 无水印 {n_clean} / 有水印 {n_moved} / 错误 {n_err}"
           f"（详情: {video_dir / 'watermark_report.json'}）")
 
 
 # ---------- selftest ----------
 
-def _collect_selftests():
-    return sorted(
-        (name, fn) for name, fn in globals().items()
-        if name.startswith("test_") and callable(fn)
-    )
-
-
 def run_selftests():
-    tests = _collect_selftests()
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"  PASS {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            print(f"  FAIL {name}: {type(e).__name__}: {e}")
-    print(f"selftest: {len(tests) - failed}/{len(tests)} 项通过")
-    return failed == 0
+    return _st.run_selftests(globals())
 
 
 # ---------- tests: 纯逻辑 ----------
@@ -345,14 +399,14 @@ def main(argv=None):
     if not args.video_dir:
         parser.error("请提供视频目录")
     if not api_key:
-        print("错误: 未设置环境变量 DASHSCOPE_API_KEY（阿里云百炼 API Key）",
+        log("错误: 未设置环境变量 DASHSCOPE_API_KEY（阿里云百炼 API Key）",
               file=sys.stderr)
         sys.exit(1)
     try:
         run(Path(args.video_dir), args.frames, api_key, args.base_url,
             args.model, args.dry_run, args.rejudge)
     except FilterError as e:
-        print(f"错误: {e}", file=sys.stderr)
+        log(f"错误: {e}", err=True)
         sys.exit(1)
 
 
